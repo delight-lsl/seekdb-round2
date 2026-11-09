@@ -84,7 +84,7 @@ int ObExprJsonMemberOf::check_json_member_of_array(const ObIJsonBase *json_a,
   return ret;
 }
 
-int ObExprJsonMemberOf::eval_json_member_of(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
+int ObExprJsonMemberOf::eval_json_member_of(const ObExpr &expr, ObEvalCtx &ctx, Datum &res)
 {
   INIT_SUCC(ret);
   ObIJsonBase *json_a = NULL;
@@ -95,9 +95,9 @@ int ObExprJsonMemberOf::eval_json_member_of(const ObExpr &expr, ObEvalCtx &ctx, 
   lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("JSONModule"));
   bool is_null_result = (expr.args_[0]->datum_meta_.type_ == ObNullType);
   if (!is_null_result) {
-    ObDatum *json_datum = NULL;
+    Datum *json_datum = NULL;
     ObExpr *json_arg = expr.args_[0];
-    ObObjType type2 = expr.args_[1]->datum_meta_.type_;
+    SqlValueType type2 = expr.args_[1]->datum_meta_.type_;
     if (OB_FAIL(temp_allocator.eval_arg(json_arg, ctx, json_datum))) {
     } else if (json_datum->is_null()) {
       is_null_result = true; 

@@ -18,6 +18,7 @@
 
 #ifdef _WIN32
 #include "lib/utility/alloc_assist.h"
+#include "sql/engine/expr/ob_expr_util.h"
 #define memmem ob_memmem
 #endif
 #include "share/object/ob_decint_scale_util.h"
@@ -25,6 +26,7 @@
 #include "share/ob_lob_access_utils.h"
 #include "share/ob_json_access_utils.h"
 #include "sql/engine/expr/ob_datum_cast.h"
+#include "sql/engine/expr/ob_expr_column_conv.h"
 #include "sql/engine/expr/ob_obj_cast_runtime.h"
 #include "query/engine/expr/ob_decimal_int_scale.h"
 #include "share/object/ob_array_cast.h"
@@ -46,14 +48,14 @@ using namespace oceanbase::common;
 #define CAST_FUNC_NAME(intype, outtype)                    \
   int intype##_##outtype(const sql::ObExpr &expr,          \
                               sql::ObEvalCtx &ctx,         \
-                              sql::ObDatum &res_datum)
+                              sql::Datum &res_datum)
 
 #define CAST_ENUMSET_FUNC_NAME(intype, outtype)            \
   int intype##_##outtype(const sql::ObExpr &expr,          \
                          const common::ObIArray<common::ObString> &str_values,\
                          const uint64_t cast_mode,         \
                          sql::ObEvalCtx &ctx,              \
-                         sql::ObDatum &res_datum)
+                         sql::Datum &res_datum)
 
 #define DEF_BATCH_CAST_FUNC(in_tc, out_tc)                                                         \
   template <>                                                                                      \
@@ -67,8 +69,8 @@ using namespace oceanbase::common;
 
 #define EVAL_ARG_FOR_CAST_TO_JSON()                                                                   \
   int ret = OB_SUCCESS;                                                                               \
-  ObDatum *child_res = NULL;                                                                          \
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;                                               \
+  Datum *child_res = NULL;                                                                          \
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;                                               \
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_res))) {                                                 \
     LOG_WARN("eval arg failed", K(ret));                                                              \
   } else if (child_res->is_null()) {                                                                  \
@@ -81,7 +83,7 @@ using namespace oceanbase::common;
 // values stay non-null where the type supports them.
 #define EVAL_STRING_ARG()                                  \
   int ret = OB_SUCCESS;                                    \
-  ObDatum *child_res = NULL;                               \
+  Datum *child_res = NULL;                               \
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_res))) {      \
     LOG_WARN("eval arg failed", K(ret), K(ctx));           \
   } else if (child_res->is_null()) {                       \
@@ -90,14 +92,14 @@ using namespace oceanbase::common;
 
 #define DEF_IN_OUT_TYPE()                                 \
   int warning = OB_SUCCESS;                               \
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;   \
-  ObObjType out_type = expr.datum_meta_.type_;            \
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;   \
+  SqlValueType out_type = expr.datum_meta_.type_;            \
   UNUSEDx(warning, in_type, out_type);
-// If using ObDatum::get_xxx(), need to pass an additional parameter to specify the function name, so the macro directly casts below
+// If using Datum::get_xxx(), need to pass an additional parameter to specify the function name, so the macro directly casts below
 #define DEF_IN_OUT_VAL(in_type, out_type, init_val)                      \
   int warning = OB_SUCCESS;                                              \
   UNUSED(warning);                                                       \
-  in_type in_val = *(reinterpret_cast<const in_type*>(child_res->ptr_)); \
+  in_type in_val = read_native_numeric<in_type>(*child_res); \
   out_type out_val = (init_val);
 
 #define CAST_FAIL(stmt) \
@@ -120,7 +122,7 @@ using namespace oceanbase::common;
 
 #define EVAL_ARG()                                                                                 \
   int ret = OB_SUCCESS;                                                                            \
-  ObDatum *child_res = NULL;                                                                       \
+  Datum *child_res = NULL;                                                                       \
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_res))) {                                              \
     LOG_WARN("eval arg failed", K(ret), K(ctx));                                                   \
   } else if (child_res->is_null()) {                                                               \
@@ -131,10 +133,10 @@ using namespace oceanbase::common;
   ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);                                         \
   ObEvalCtx::TempAllocGuard alloc_guard(ctx);                                                      \
   ObIAllocator &alloc = alloc_guard.get_allocator();                                               \
-  ObDatumVector arg_dv = expr.args_[0]->locate_expr_datumvector(ctx);                              \
-  ObDatumVector result_dv = expr.locate_expr_datumvector(ctx)
+  DatumVector arg_dv = expr.args_[0]->locate_expr_datumvector(ctx);                              \
+  DatumVector result_dv = expr.locate_expr_datumvector(ctx)
 
-template <ObObjTypeClass in_tc, ObObjTypeClass out_tc>
+template <SqlTypeClass in_tc, SqlTypeClass out_tc>
 struct DefinedBatchCast
 {
   static constexpr bool value_ = false;
@@ -220,14 +222,14 @@ int get_cast_ret_wrap(const ObCastMode &cast_mode, int ret, int &warning)
           || OB_ERR_DATA_TRUNCATED == warning                     \
           || OB_ERR_DOUBLE_TRUNCATED == warning                   \
           || OB_ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD == warning) { \
-        res_datum.set_otimestamp_tiny(value);                     \
+        ret = ObExprUtil::set_otimestamp_tiny(expr, ctx, res_datum, value);                     \
       } else if (CM_IS_ZERO_ON_WARN(expr.extra_)) {               \
-        res_datum.set_otimestamp_tiny(ObOTimestampData());        \
+        ret = ObExprUtil::set_otimestamp_tiny(expr, ctx, res_datum, ObOTimestampData());        \
       } else {                                                    \
         res_datum.set_null();                                     \
       }                                                           \
     } else {                                                      \
-      res_datum.set_otimestamp_tiny(value);                       \
+      ret = ObExprUtil::set_otimestamp_tiny(expr, ctx, res_datum, value);                       \
     }                                                             \
   } while (0)
 
@@ -279,7 +281,7 @@ static OB_INLINE int serialize_obnumber(number::ObNumber &nmb,
 }
 
 int ObDatumHexUtils::hex(const ObExpr &expr, const ObString &in_str, ObEvalCtx &ctx,
-                         ObIAllocator &calc_alloc, ObDatum &res_datum, bool upper_case)
+                         ObIAllocator &calc_alloc, Datum &res_datum, bool upper_case)
 {
   int ret = OB_SUCCESS;
   if (in_str.empty()) {
@@ -349,25 +351,11 @@ int ObDatumHexUtils::hex(const ObExpr &expr, const ObString &in_str, ObEvalCtx &
   return ret;
 }
 
-static OB_INLINE int common_construct_otimestamp(const ObObjType type,
-                                                 const ObDatum &in_datum,
+static OB_INLINE int common_construct_otimestamp(const SqlValueType type,
+                                                 const Datum &in_datum,
                                                  ObOTimestampData &out_val);
 
-int ObDatumHexUtils::hextoraw_string(const ObExpr &expr,
-                              const ObString &in_str,
-                              ObEvalCtx &ctx,
-                              ObDatum &res_datum,
-                              bool &has_set_res)
-{
-  int ret = OB_SUCCESS;
-  if (0 == in_str.length()) {
-    res_datum.set_null();
-  } else if (OB_FAIL(unhex(expr, in_str, ctx, res_datum, has_set_res))) {
-  }
-  return ret;
-}
-
-static int common_json_bin(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum, ObString &raw_bin)
+static int common_json_bin(const ObExpr &expr, ObEvalCtx &ctx, Datum &res_datum, ObString &raw_bin)
 {
   int ret = OB_SUCCESS;
   ObTextStringDatumResult text_result(ObJsonType, &expr, &ctx, &res_datum);
@@ -379,7 +367,7 @@ static int common_json_bin(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datu
   return ret;
 }
 
-static int common_gis_wkb(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum, ObString &wkb, bool skip_ver = false)
+static int common_gis_wkb(const ObExpr &expr, ObEvalCtx &ctx, Datum &res_datum, ObString &wkb, bool skip_ver = false)
 {
   int ret = OB_SUCCESS;
   ObTextStringDatumResult text_result(ObGeometryType, &expr, &ctx, &res_datum);
@@ -398,60 +386,14 @@ static int common_gis_wkb(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum
 }
 
 static int common_copy_string(const ObExpr &expr, const ObString &src, ObEvalCtx &ctx,
-                       ObDatum &res_datum, const int64_t align_offset = 0);
+                       Datum &res_datum, const int64_t align_offset = 0);
 
-int ObDatumHexUtils::uint_to_raw(const number::ObNumber &uint_num, const ObExpr &expr,
-                           ObEvalCtx &ctx, ObDatum &res_datum)
-{
-  int ret = OB_SUCCESS;
-  const int64_t max_raw_hex_len = 40;
-  char uint_buf[number::ObNumber::MAX_TOTAL_SCALE] = {0};
-  int64_t uint_pos = 0;
-  ObString uint_str;
-  if (OB_FAIL(uint_num.format(uint_buf, number::ObNumber::MAX_TOTAL_SCALE, uint_pos, 0))) {
-  } else if (uint_pos > max_raw_hex_len) {
-    ret = OB_ERR_INVALID_HEX_NUMBER;
-  } else {
-    uint_str.assign_ptr(uint_buf, static_cast<int32_t>(uint_pos));
-    bool has_set_res = false;
-    if (OB_FAIL(unhex(expr, uint_str, ctx, res_datum, has_set_res))) {
-    }
-  }
-  return ret;
-}
-
-int ObDatumHexUtils::get_uint(
-    const ObObjType &in_type, const int8_t scale, const ObDatum &in, ObIAllocator &alloc,
-    number::ObNumber &out)
-{
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!ob_is_accurate_numeric_type(in_type))) {
-    ret = OB_ERR_INVALID_HEX_NUMBER;
-  } else if (ObNumberType == in_type || ObUNumberType == in_type) {
-    const number::ObNumber value(in.get_number());
-    if (OB_FAIL(out.from(value, alloc))) {
-    } else if (OB_UNLIKELY(!out.is_integer()) || OB_UNLIKELY(out.is_negative())) {
-      ret = OB_ERR_INVALID_HEX_NUMBER;
-    }
-  } else if (ObDecimalIntType == in_type) {
-    if (OB_FAIL(wide::to_number(in.get_decimal_int(), in.get_int_bytes(), scale, alloc, out))) {
-    } else if (OB_UNLIKELY(!out.is_integer()) || OB_UNLIKELY(out.is_negative())) {
-      ret = OB_ERR_INVALID_HEX_NUMBER;
-    }
-  } else {
-    if (OB_UNLIKELY(in.get_int() < 0)) {
-      ret = OB_ERR_INVALID_HEX_NUMBER;
-    } else if (OB_FAIL(out.from(in.get_int(), alloc))) {
-    }
-  }
-  return ret;
-}
 // Compared to common_copy_string_zf, zero fill is not considered. Directly copy the content from src to res_datum
 // %align_offset is used in mysql mode to align blob to other charset.
 static int common_copy_string(const ObExpr &expr,
                               const ObString &src,
                               ObEvalCtx &ctx,
-                              ObDatum &res_datum,
+                              Datum &res_datum,
                               const int64_t align_offset /* = 0 */)
 {
   int ret = OB_SUCCESS;
@@ -471,7 +413,7 @@ static int common_copy_string(const ObExpr &expr,
 static int common_copy_string_zf(const ObExpr &expr,
                               const ObString &src,
                               ObEvalCtx &ctx,
-                              ObDatum &res_datum,
+                              Datum &res_datum,
                               const int64_t align_offset = 0)
 {
   int ret = OB_SUCCESS;
@@ -507,7 +449,7 @@ static int common_copy_string_zf(const ObExpr &expr,
 int ObDatumHexUtils::unhex(const ObExpr &expr,
                            const ObString &in_str,
                            ObEvalCtx &ctx,
-                           ObDatum &res_datum,
+                           Datum &res_datum,
                            bool &has_set_res)
 {
   int ret = OB_SUCCESS;
@@ -564,7 +506,7 @@ int ObDatumHexUtils::unhex(const ObExpr &expr,
 static int common_int_datetime(const ObExpr &expr,
                                const int64_t in_val,
                                ObEvalCtx &ctx,
-                               ObDatum &res_datum)
+                               Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   GET_SESSION()
@@ -603,7 +545,7 @@ static OB_INLINE int common_int_number(const ObExpr &expr,
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   if ((ObUNumberType == out_type) && CAST_FAIL(numeric_negative_check(in_val))) {
   } else if (OB_FAIL(nmb.from(in_val, alloc))) {
   }
@@ -613,7 +555,7 @@ static OB_INLINE int common_int_number(const ObExpr &expr,
 
 static OB_INLINE int common_int_date(const ObExpr &expr,
                            const int64_t in_val,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -632,7 +574,7 @@ static OB_INLINE int common_int_date(const ObExpr &expr,
 
 static OB_INLINE int common_int_mdate(const ObExpr &expr,
                            const int64_t in_val,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -648,7 +590,7 @@ static OB_INLINE int common_int_mdate(const ObExpr &expr,
 
 static OB_INLINE int common_int_time(const ObExpr &expr,
                            const int64_t in_val,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -662,7 +604,7 @@ static OB_INLINE int common_int_time(const ObExpr &expr,
 
 static OB_INLINE int common_int_year(const ObExpr &expr,
                            const int64_t in_val,
-                           ObDatum &res_datum,
+                           Datum &res_datum,
                            int &warning)
 {
   int ret = OB_SUCCESS;
@@ -676,14 +618,14 @@ static OB_INLINE int common_int_year(const ObExpr &expr,
 
 static OB_INLINE int common_int_year(const ObExpr &expr,
                            const int64_t in_val,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int warning = OB_SUCCESS;
   return common_int_year(expr, in_val, res_datum, warning);
 }
 
 static OB_INLINE int common_uint_int(const ObExpr &expr,
-                                     const ObObjType &out_type,
+                                     const SqlValueType &out_type,
                                      uint64_t in_val,
                                      ObEvalCtx &ctx,
                                      int64_t &out_val)
@@ -700,7 +642,7 @@ static OB_INLINE int common_uint_int(const ObExpr &expr,
 
 int ObDataTypeCastUtil::common_uint_int_wrap(
     const ObExpr &expr,
-    const ObObjType &out_type,
+    const SqlValueType &out_type,
     uint64_t in_val,
     ObEvalCtx &ctx,
     int64_t &out_val)
@@ -712,13 +654,13 @@ static int common_string_int(const ObExpr &expr,
                              const uint64_t &extra,
                              const ObString &in_str,
                              const bool is_str_integer_cast,
-                             ObDatum &res_datum,
+                             Datum &res_datum,
                              int &warning)
 {
   int ret = OB_SUCCESS;
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
   ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   int64_t out_val = 0;
   ret = common_string_integer(extra, in_type, in_cs_type, in_str, is_str_integer_cast, out_val);
   if (CAST_FAIL_CM(ret, extra)) {
@@ -734,7 +676,7 @@ static int common_string_int(const ObExpr &expr,
                              const uint64_t &extra,
                              const ObString &in_str,
                              const bool is_str_integer_cast,
-                             ObDatum &res_datum)
+                             Datum &res_datum)
 {
   int warning = OB_SUCCESS;
   return common_string_int(expr, extra, in_str, is_str_integer_cast, res_datum, warning);
@@ -743,7 +685,7 @@ static int common_string_int(const ObExpr &expr,
 static int common_string_uint(const ObExpr &expr,
                               const ObString &in_str,
                               const bool is_str_integer_cast,
-                              ObDatum &res_datum)
+                              Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   uint64_t out_val = 0;
@@ -759,11 +701,11 @@ static int common_string_uint(const ObExpr &expr,
 }
 
 int common_string_double(const ObExpr &expr,
-                         const ObObjType &in_type,
+                         const SqlValueType &in_type,
                          const ObCollationType &in_cs_type,
-                         const ObObjType &out_type,
+                         const SqlValueType &out_type,
                          const ObString &in_str,
-                         ObDatum &res_datum)
+                         Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -816,7 +758,7 @@ static OB_INLINE int common_double_float(const ObExpr &expr,
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
   out_val = static_cast<float>(in_val);
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   {
     double truncated_val = in_val;
     if (ob_is_float_tc(out_type) && CM_IS_COLUMN_CONVERT(expr.extra_)) {
@@ -846,13 +788,11 @@ static OB_INLINE int common_string_float(const ObExpr &expr,
                                float &out_val)
 {
   int ret = OB_SUCCESS;
-  double tmp_double = 0.0;
-  ObDatum tmp_datum;
-  tmp_datum.ptr_ = reinterpret_cast<const char*>(&tmp_double);
-  tmp_datum.pack_ = sizeof(double);
+  Datum tmp_datum;
+  tmp_datum.set_double(0.0);
   DEF_IN_OUT_TYPE();
   if (OB_FAIL(common_string_double(expr, in_type, expr.args_[0]->datum_meta_.cs_type_, out_type, in_str, tmp_datum))) {
-  } else if (OB_FAIL(common_double_float(expr, tmp_double, out_val))) {
+  } else if (OB_FAIL(common_double_float(expr, tmp_datum.get_double(), out_val))) {
   }
   return ret;
 }
@@ -867,7 +807,7 @@ int ObDataTypeCastUtil::common_string_float_wrap(
 
 static OB_INLINE int common_string_date(const ObExpr &expr,
                                         const ObString &in_str,
-                                        ObDatum &res_datum)
+                                        Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -888,7 +828,7 @@ static OB_INLINE int common_string_date(const ObExpr &expr,
 
 static OB_INLINE int common_string_mdate(const ObExpr &expr,
                                         const ObString &in_str,
-                                        ObDatum &res_datum)
+                                        Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -911,7 +851,7 @@ static OB_INLINE int common_string_mdate(const ObExpr &expr,
 
 static OB_INLINE int common_string_time(const ObExpr &expr,
                                         const ObString &in_str,
-                                        ObDatum &res_datum)
+                                        Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -929,7 +869,7 @@ static OB_INLINE int common_string_time(const ObExpr &expr,
 
 static OB_INLINE int common_string_year(const ObExpr &expr,
                                         const ObString &in_str,
-                                        ObDatum &res_datum)
+                                        Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -939,12 +879,10 @@ static OB_INLINE int common_string_year(const ObExpr &expr,
   // so need to unset warn on fail when do string_int cast.
   const uint64_t extra = CM_UNSET_STRING_INTEGER_TRUNC(CM_SET_WARN_ON_FAIL(expr.extra_));
   // datum size of year type is one byte!
-  int64_t tmp_int = 0;
-  ObDatum tmp_res;
-  tmp_res.int_ = &tmp_int;
-  tmp_res.pack_ = sizeof(tmp_int);
+  Datum tmp_res;
+  tmp_res.set_int(0);
   if (OB_FAIL(common_string_int(expr, extra, in_str, is_str_int_cast, tmp_res, warning))) {
-  } else if (0 == tmp_int) {
+  } else if (0 == tmp_res.get_int()) {
     // cast '0000' to year, result is 0. cast '0'/'00'/'00000' to year, result is 2000.
     if (OB_SUCCESS != warning || 4 == in_str.length()) {
       SET_RES_YEAR(ObTimeConverter::ZERO_YEAR);
@@ -954,7 +892,7 @@ static OB_INLINE int common_string_year(const ObExpr &expr,
     }
     CAST_FAIL(warning);
   } else {
-    if (CAST_FAIL(common_int_year(expr, tmp_int, res_datum, warning))) {
+    if (CAST_FAIL(common_int_year(expr, tmp_res.get_int(), res_datum, warning))) {
     } else if (CM_IS_DEMOTE_CAST(expr.extra_) && (OB_ERR_DATA_TRUNCATED == warning)) {
       // demote cast can accept the string result after truncate, for example, '2020-02-30' can be
       // treated as '2020', '2020abc' can be treated as '2020'.
@@ -1051,7 +989,7 @@ static int common_string_decimalint(const ObExpr &expr, const ObString &in_str,
   break
 
   int ret = OB_SUCCESS;
-  ObObjType in_type = expr.args_[0]->datum_meta_.get_type();
+  SqlValueType in_type = expr.args_[0]->datum_meta_.get_type();
   int16_t in_scale = 0, in_precision = 0;
   ObScale out_scale = expr.datum_meta_.scale_;
   ObPrecision out_prec = expr.datum_meta_.precision_;
@@ -1185,7 +1123,7 @@ int ObDataTypeCastUtil::common_string_decimalint_wrap(const ObExpr &expr, const 
 static OB_INLINE int common_string_datetime(const ObExpr &expr,
                                             const ObString &in_str,
                                             ObEvalCtx &ctx,
-                                            ObDatum &res_datum)
+                                            Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -1231,7 +1169,7 @@ static OB_INLINE int common_string_datetime(const ObExpr &expr,
 static OB_INLINE int common_string_mdatetime(const ObExpr &expr,
                                             const ObString &in_str,
                                             ObEvalCtx &ctx,
-                                            ObDatum &res_datum)
+                                            Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -1269,7 +1207,7 @@ static OB_INLINE int common_string_mdatetime(const ObExpr &expr,
 }
 
 
-static OB_INLINE int common_bit_datetime(const ObExpr &expr, const ObDatum *child_res, ObDatum &res_datum,
+static OB_INLINE int common_bit_datetime(const ObExpr &expr, const Datum *child_res, Datum &res_datum,
                              ObEvalCtx &ctx)
 {
   int ret = OB_SUCCESS;
@@ -1309,7 +1247,7 @@ static OB_INLINE int common_bit_datetime(const ObExpr &expr, const ObDatum *chil
       ObLengthSemantics length = expr.args_[0]->datum_meta_.length_semantics_;
       if (OB_FAIL(bit_to_char_array(in_val, length, buf, BUF_LEN, pos))) {
       } else {
-        ObObjType out_type = expr.datum_meta_.type_;
+        SqlValueType out_type = expr.datum_meta_.type_;
         ObString str(pos, buf);
         const common::ObTimeZoneInfo *tz_info_local = NULL;
         ObSolidifiedVarsGetter helper(expr, ctx, session);
@@ -1334,8 +1272,8 @@ static OB_INLINE int common_bit_datetime(const ObExpr &expr, const ObDatum *chil
   return ret;
 }
 
-static OB_INLINE int common_bit_date(const ObExpr &expr, const ObDatum *child_res,
-                                     ObDatum &res_datum, ObEvalCtx &ctx)
+static OB_INLINE int common_bit_date(const ObExpr &expr, const Datum *child_res,
+                                     Datum &res_datum, ObEvalCtx &ctx)
 {
   int ret = OB_SUCCESS;
   DEF_IN_OUT_VAL(uint64_t, int32_t, 0);
@@ -1411,7 +1349,7 @@ static OB_INLINE int common_get_bit_len(const ObString &str, int32_t &bit_len)
 static int common_string_bit(const ObExpr &expr,
                              const ObString &in_str,
                              ObEvalCtx &ctx,
-                             ObDatum &res_datum)
+                             Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   UNUSED(ctx);
@@ -1419,7 +1357,7 @@ static int common_string_bit(const ObExpr &expr,
   int32_t bit_len = 0;
   if (OB_FAIL(common_get_bit_len(in_str, bit_len))) {
   } else {
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     uint64_t out_val = 0;
     if (ObHexStringType == in_type && in_str.empty()) {
       ret = OB_ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD;
@@ -1443,7 +1381,7 @@ static int common_string_bit(const ObExpr &expr,
 // lob type and other types conversion will use longtext type as an intermediate type, and call some existing longtext related conversion functions
 // These functions put the conversion result into get_str_res_mem, which is where the result of string type expressions is stored.
 // Therefore added the following function, to copy the result first from get_str_res_mem to get_reset_tmp_alloc space.
-int copy_datum_str_with_tmp_alloc(ObEvalCtx &ctx, ObDatum &res_datum, ObString &res_str)
+int copy_datum_str_with_tmp_alloc(ObEvalCtx &ctx, Datum &res_datum, ObString &res_str)
 {
   int ret = OB_SUCCESS;
   ObEvalCtx::TempAllocGuard alloc_guard(ctx);
@@ -1464,13 +1402,13 @@ int copy_datum_str_with_tmp_alloc(ObEvalCtx &ctx, ObDatum &res_datum, ObString &
 int common_check_convert_string(const ObExpr &expr,
                                 ObEvalCtx &ctx,
                                 const ObString &in_str,
-                                ObDatum &res_datum,
+                                Datum &res_datum,
                                 bool &has_set_res)
 {
   int ret = OB_SUCCESS;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
   ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
   // When convert blob/binary/varbinary to other charset, need to align to mbminlen of destination charset
   // by add '\0' prefix in mysql mode. (see mysql String::copy)
@@ -1488,13 +1426,13 @@ int common_check_convert_string(const ObExpr &expr,
 }
 
 static int common_string_string(const ObExpr &expr,
-                                const ObObjType in_type,
+                                const SqlValueType in_type,
                                 const ObCollationType in_cs_type,
-                                const ObObjType out_type,
+                                const SqlValueType out_type,
                                 const ObCollationType out_cs_type,
                                 const ObString &in_str,
                                 ObEvalCtx &ctx,
-                                ObDatum &res_datum,
+                                Datum &res_datum,
                                 bool& has_set_res)
 {
   int ret = OB_SUCCESS;
@@ -1528,14 +1466,14 @@ static int common_string_string(const ObExpr &expr,
     }
   }
   LOG_DEBUG("string_string cast", K(ret), K(in_str),
-              K(ObString(res_datum.len_, res_datum.ptr_)));
+              K(res_datum.get_string()));
   return ret;
 }
 
 static int common_string_otimestamp(const ObExpr &expr,
                                     const ObString &in_str,
                                     ObEvalCtx &ctx,
-                                    ObDatum &res_datum)
+                                    Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   GET_SESSION()
@@ -1559,7 +1497,7 @@ static int common_string_otimestamp(const ObExpr &expr,
   return ret;
 }
 
-int get_enumset_meta(sql::ObEvalCtx &ctx, const ObObjMeta &obj_meta, const ObEnumSetMeta *&meta) {
+int get_enumset_meta(sql::ObEvalCtx &ctx, const SqlTypeMeta &obj_meta, const ObEnumSetMeta *&meta) {
   int ret = OB_SUCCESS;
   const uint16_t subschema_id = obj_meta.get_subschema_id();
   if (OB_FAIL(ctx.exec_ctx_.get_enumset_meta_by_subschema_id(subschema_id, false, meta))) {
@@ -1576,7 +1514,7 @@ static OB_INLINE int common_enumset_string(const ObExpr &enumset_expr,
 {
   int ret = OB_SUCCESS;
   const ObEnumSetMeta *meta = NULL;
-  const ObObjType in_type = enumset_expr.datum_meta_.type_;
+  const SqlValueType in_type = enumset_expr.datum_meta_.type_;
   if (0 == in_val) {
     // empty string, do nothing
   } else if (OB_FAIL(get_enumset_meta(ctx, enumset_expr.obj_meta_, meta))) {
@@ -1594,11 +1532,11 @@ static OB_INLINE int common_enumset_string(const ObExpr &enumset_expr,
 static int get_text_full_data(const sql::ObExpr &expr,
                               sql::ObEvalCtx &ctx,
                               ObIAllocator *allocator,
-                              ObDatum* in_datum,
+                              Datum* in_datum,
                               ObString &data)
 {
   int ret = OB_SUCCESS;
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
   ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
   if (ob_is_text_tc(in_type)) {
     bool has_lob_header = expr.args_[0]->obj_meta_.has_lob_header();
@@ -1614,7 +1552,7 @@ static int get_text_full_data(const sql::ObExpr &expr,
 static int common_copy_string_to_text_result(const ObExpr &expr,
                                              const ObString &src,
                                              ObEvalCtx &ctx,
-                                             ObDatum &res_datum,
+                                             Datum &res_datum,
                                              const int64_t align_offset = 0)
 {
   int ret = OB_SUCCESS;
@@ -1638,7 +1576,7 @@ static int common_copy_string_to_text_result(const ObExpr &expr,
 static int common_copy_string_zf_to_text_result(const ObExpr &expr,
                                                 const ObString &src,
                                                 ObEvalCtx &ctx,
-                                                ObDatum &res_datum,
+                                                Datum &res_datum,
                                                 const int64_t align_offset = 0)
 {
   int ret = OB_SUCCESS;
@@ -1672,11 +1610,11 @@ static int common_string_text(const ObExpr &expr,
                               const ObString &in_str,
                               ObEvalCtx &ctx,
                               const ObLobLocatorV2 *lob_locator,
-                              ObDatum &res_datum)
+                              Datum &res_datum)
 {
   int ret = OB_SUCCESS;
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_; // ObLongTextType
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_; // ObLongTextType
   const ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
   const ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
   const bool has_lob_header = expr.obj_meta_.has_lob_header();
@@ -1724,7 +1662,7 @@ static int common_string_text(const ObExpr &expr,
 static int common_uint_bit(const ObExpr &expr,
                            const uint64_t &in_value,
                            ObEvalCtx &ctx,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -1740,8 +1678,8 @@ static int common_uint_bit(const ObExpr &expr,
 }
 
 static OB_INLINE int common_number_uint(const ObExpr &expr,
-                                        const ObDatum &child_res,
-                                        ObDatum &res_datum)
+                                        const Datum &child_res,
+                                        Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   const number::ObNumber nmb(child_res.get_number());
@@ -1758,9 +1696,9 @@ static OB_INLINE int common_number_uint(const ObExpr &expr,
 }
 
 static OB_INLINE int common_number_string(const ObExpr &expr,
-                                          const ObDatum &child_res,
+                                          const Datum &child_res,
                                           ObEvalCtx &ctx,
-                                          ObDatum &res_datum)
+                                          Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   const number::ObNumber nmb(child_res.get_number());
@@ -1778,14 +1716,18 @@ static OB_INLINE int common_number_string(const ObExpr &expr,
   return ret;
 }
 
-static OB_INLINE int common_decimalint_string(const ObExpr &expr, const ObDatum &child_res,
-                                              ObEvalCtx &ctx, ObDatum &res_datum)
+static OB_INLINE int common_decimalint_string(const ObExpr &expr, const Datum &child_res,
+                                              ObEvalCtx &ctx, Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   char buffer[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
   int64_t pos = 0;
   ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
-  if (OB_FAIL(wide::to_string(child_res.get_decimal_int(), child_res.get_int_bytes(),
+  alignas(8) char coefficient_scratch[64];
+  common::ObDatum coefficient;
+  if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+          child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) {
+  } else if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                      in_scale, buffer, sizeof(buffer), pos))) {
   }
   if (OB_SUCC(ret)) {
@@ -1822,7 +1764,7 @@ int ObDatumCast::common_scale_decimalint(const ObDecimalInt *decint, const int32
                                          ObDecimalIntBuilder &val,
                                          const ObUserLoggingCtx *user_logging_ctx)
 {
-  ObSqlObjCastRuntime runtime(user_logging_ctx);
+  ObSqlDatumCastRuntime runtime(user_logging_ctx);
   return common::decint_scale::scale_decimalint(
       decint, int_bytes, in_scale, out_scale, out_prec, cast_mode, val, &runtime);
 }
@@ -1868,7 +1810,7 @@ void ObDataTypeCastUtil::log_user_error_warning(const ObUserLoggingCtx *user_log
 static int common_json_string(const ObExpr &expr,
                               ObEvalCtx &ctx,
                               ObIAllocator& allocator,
-                              const ObDatum &in,
+                              const Datum &in,
                               ObString& res_str)
 {
   int ret = OB_SUCCESS;
@@ -1892,8 +1834,8 @@ static int common_json_string(const ObExpr &expr,
     } else {
       j_str.assign_ptr(j_buf.ptr(), j_buf.length());
       // convert charset if nesscary
-      ObObjType in_type = ObLongTextType;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType in_type = ObLongTextType;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
       ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
       // if out not binary but charset not same, convert
@@ -1902,7 +1844,7 @@ static int common_json_string(const ObExpr &expr,
       if (!is_need_charset_convert) {
         res_str = j_str;
       } else {
-        ObDatum tmp_datum;
+        Datum tmp_datum;
         if (OB_FAIL(common_string_string(expr, in_type, in_cs_type, out_type,
                                         out_cs_type, j_str, ctx, tmp_datum, has_set_res))) {
         } else if (tmp_datum.is_null()) {
@@ -2024,7 +1966,7 @@ static int common_floating_string(const ObExpr &expr,
                                   const IN_TYPE in_val,
                                   const ob_gcvt_arg_type arg_type,
                                   ObEvalCtx &ctx,
-                                  ObDatum &res_datum)
+                                  Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
@@ -2065,7 +2007,7 @@ static int common_number_datetime(const number::ObNumber nmb,
 static OB_INLINE int common_double_datetime(const ObExpr &expr,
                            const double val_double,
                            ObEvalCtx &ctx,
-                           ObDatum &res_datum)
+                           Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -2074,7 +2016,7 @@ static OB_INLINE int common_double_datetime(const ObExpr &expr,
     ret = OB_ERR_UNEXPECTED;
   } else {
     int64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObNumStackOnceAlloc tmp_alloc;
     number::ObNumber number;
     const common::ObTimeZoneInfo *tz_info_local = NULL;
@@ -2111,7 +2053,7 @@ static OB_INLINE int common_double_datetime(const ObExpr &expr,
 
 static int common_double_time(const ObExpr &expr,
                               const double val_double,
-                              ObDatum &res_datum)
+                              Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   int warning = OB_SUCCESS;
@@ -2128,7 +2070,7 @@ static int common_double_time(const ObExpr &expr,
   return ret;
 }
 
-int common_datetime_string(const ObExpr &expr, const ObObjType in_type, const ObObjType out_type,
+int common_datetime_string(const ObExpr &expr, const SqlValueType in_type, const SqlValueType out_type,
                            const ObScale in_scale,
                            const int64_t in_val, ObEvalCtx &ctx, char *buf,
                            int64_t buf_len, int64_t &out_len)
@@ -2170,7 +2112,7 @@ int common_datetime_string(const ObExpr &expr, const ObObjType in_type, const Ob
   return ret;
 }
 
-int common_datetime_geometry(const ObExpr &expr, const ObDatum *child_res, ObDatum &res_datum,
+int common_datetime_geometry(const ObExpr &expr, const Datum *child_res, Datum &res_datum,
                              ObEvalCtx &ctx)
 {
   int ret = OB_SUCCESS;
@@ -2209,7 +2151,7 @@ int common_datetime_geometry(const ObExpr &expr, const ObDatum *child_res, ObDat
 }
 
 static int common_year_int(const ObExpr &expr,
-                           const ObObjType &out_type,
+                           const SqlValueType &out_type,
                            const uint8_t in_val,
                            int64_t &out_val)
 {
@@ -2256,8 +2198,8 @@ int ObDataTypeCastUtil::common_double_int_wrap(
 }
 // According to type, construct ObOTimestampData object from the space pointed by ptr
 // So the construction logic is different
-static OB_INLINE int common_construct_otimestamp(const ObObjType type,
-                                                 const ObDatum &in_datum,
+static OB_INLINE int common_construct_otimestamp(const SqlValueType type,
+                                                 const Datum &in_datum,
                                                  ObOTimestampData &out_val)
 {
   int ret = OB_SUCCESS;
@@ -2265,7 +2207,7 @@ static OB_INLINE int common_construct_otimestamp(const ObObjType type,
   return ret;
 }
 
-static OB_INLINE int common_construct_otimestamp(const ObObjType type,
+static OB_INLINE int common_construct_otimestamp(const SqlValueType type,
                                                  const int64_t idx,
                                                  const ObIVector &in_vec,
                                                  ObOTimestampData &out_val)
@@ -2359,51 +2301,51 @@ int ObDataTypeCastUtil::common_number_date_wrap(
 
 int cast_not_expected(const sql::ObExpr &expr,
                   sql::ObEvalCtx &ctx,
-                  sql::ObDatum &res_datum)
+                  sql::Datum &res_datum)
 {
   int ret = OB_ERR_UNEXPECTED;
   UNUSED(ctx);
   UNUSED(res_datum);
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   return ret;
 }
 
 int cast_not_support(const sql::ObExpr &expr,
                   sql::ObEvalCtx &ctx,
-                  sql::ObDatum &res_datum)
+                  sql::Datum &res_datum)
 {
   int ret = OB_NOT_SUPPORTED;
   UNUSED(ctx);
   UNUSED(res_datum);
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   LOG_USER_ERROR(OB_NOT_SUPPORTED, "type casting");
   return ret;
 }
 
 int cast_inconsistent_types(const sql::ObExpr &expr,
                   sql::ObEvalCtx &ctx,
-                  sql::ObDatum &res_datum)
+                  sql::Datum &res_datum)
 {
   int ret = OB_ERR_INVALID_TYPE_FOR_OP;
   UNUSED(ctx);
   UNUSED(res_datum);
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   LOG_ERROR("inconsistent datatypes", K(ret), K(in_type), K(out_type), K(expr.extra_));
   return ret;
 }
 
 int cast_inconsistent_types_json(const sql::ObExpr &expr,
                                     sql::ObEvalCtx &ctx,
-                                    sql::ObDatum &res_datum)
+                                    sql::Datum &res_datum)
 {
   UNUSED(ctx);
   UNUSED(res_datum);
   int ret = OB_SUCCESS;
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   if (CM_IS_IMPLICIT_CAST(expr.extra_)) {
     ret = OB_ERR_INVALID_INPUT;
   } else {
@@ -2417,7 +2359,7 @@ int cast_identity_enum_set(const sql::ObExpr &expr,
                            const ObIArray<ObString> &str_values,
                            const uint64_t cast_mode,
                            sql::ObEvalCtx &ctx,
-                           sql::ObDatum &res_datum)
+                           sql::Datum &res_datum)
 {
   UNUSED(cast_mode);
   UNUSED(str_values);
@@ -2435,13 +2377,13 @@ int cast_not_support_enum_set(const sql::ObExpr &expr,
                               const ObIArray<ObString> &str_values,
                               const uint64_t cast_mode,
                               sql::ObEvalCtx &ctx,
-                              sql::ObDatum &res_datum)
+                              sql::Datum &res_datum)
 {
   int ret = OB_NOT_SUPPORTED;
   UNUSED(ctx);
   UNUSED(res_datum);
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   LOG_WARN("not support datatypes", K(in_type), K(out_type), K(cast_mode), K(str_values), K(expr));
   LOG_USER_ERROR(OB_NOT_SUPPORTED, "cast to enum or set type");
   return ret;
@@ -2451,13 +2393,13 @@ int cast_not_expected_enum_set(const sql::ObExpr &expr,
                                const ObIArray<ObString> &str_values,
                                const uint64_t cast_mode,
                                sql::ObEvalCtx &ctx,
-                               sql::ObDatum &res_datum)
+                               sql::Datum &res_datum)
 {
   int ret = OB_ERR_UNEXPECTED;
   UNUSED(ctx);
   UNUSED(res_datum);
-  ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-  ObObjType out_type = expr.datum_meta_.type_;
+  SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+  SqlValueType out_type = expr.datum_meta_.type_;
   return ret;
 }
 
@@ -2471,11 +2413,11 @@ CAST_FUNC_NAME(unknown, other)
 // to ensure that the pointer of res_datum in the cast expression points to the space of the parameter!!!
 int cast_eval_arg(const sql::ObExpr &expr,
                   sql::ObEvalCtx &ctx,
-                  sql::ObDatum &res_datum)
+                  sql::Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   UNUSED(res_datum);
-  ObDatum *child_res = NULL;
+  Datum *child_res = NULL;
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_res))) {
   } else {
     // TODO: CG part added optimization after, so no need to assign
@@ -2492,7 +2434,7 @@ int cast_eval_arg_batch(const ObExpr &expr,
                         const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
-  ObDatum *results = expr.locate_batch_datums(ctx);
+  Datum *results = expr.locate_batch_datums(ctx);
 
   if (OB_FAIL(expr.args_[0]->eval_batch(ctx, skip, batch_size))) {
   } else if (OB_FAIL(expr.args_[1]->eval_batch(ctx, skip, batch_size))) {
@@ -2502,7 +2444,7 @@ int cast_eval_arg_batch(const ObExpr &expr,
     ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
     for (int64_t i = 0; OB_SUCC(ret) && i < batch_size; ++i) {
       batch_info_guard.set_batch_idx(i);
-      ObDatum *result = &results[i];
+      Datum *result = &results[i];
       if (skip.at(i) || eval_flags.at(i)) {
         continue;
       } else if (OB_FAIL(expr.eval(ctx, result))) {
@@ -2546,7 +2488,7 @@ CAST_FUNC_NAME(int, uint)
     if (CM_SKIP_CAST_INT_UINT(expr.extra_)) {
       LOG_DEBUG("skip cast int uint", K(ret));
     } else {
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       DEF_IN_OUT_VAL(int64_t, uint64_t, static_cast<uint64_t>(in_val));
       if (CM_NEED_RANGE_CHECK(expr.extra_) &&
           CAST_FAIL(uint_range_check(out_type, in_val, out_val))) {
@@ -2562,7 +2504,7 @@ CAST_FUNC_NAME(int, float)
 {
   EVAL_ARG()
   {
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     DEF_IN_OUT_VAL(int64_t, float, static_cast<float>(static_cast<double>(in_val)));
     if (ObUFloatType == out_type && CAST_FAIL(numeric_negative_check(out_val))) {
     } else {
@@ -2576,7 +2518,7 @@ CAST_FUNC_NAME(int, double)
 {
   EVAL_ARG()
   {
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     DEF_IN_OUT_VAL(int64_t, double, static_cast<double>(in_val));
     if (ObUDoubleType == out_type && CAST_FAIL(numeric_negative_check(out_val))) {
     } else {
@@ -2594,7 +2536,7 @@ CAST_FUNC_NAME(int, number)
     ObNumStackOnceAlloc tmp_alloc;
     number::ObNumber nmb;
     OZ(common_int_number(expr, in_val, tmp_alloc, nmb), in_val);
-    OX(res_datum.set_number(nmb));
+    OZ(ObExprUtil::set_number(expr, ctx, res_datum, nmb));
   }
   return ret;
 }
@@ -2703,7 +2645,7 @@ CAST_FUNC_NAME(int, json)
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     ObIJsonBase *j_base = NULL;
     int64_t in_val = child_res->get_int();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     bool bool_val = (in_val == 1) ? true : false;
     ObJsonBoolean j_bool(bool_val);
     ObJsonInt j_int(in_val);
@@ -2746,10 +2688,10 @@ CAST_FUNC_NAME(int, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, int_bytes, in_scale, out_scale,
                                                        out_prec, expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, int_bytes);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, int_bytes);
     }
   }
   return ret;
@@ -2844,7 +2786,7 @@ CAST_FUNC_NAME(uint, number)
     number::ObNumber number;
     if (OB_FAIL(number.from(in_val, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -2967,7 +2909,7 @@ CAST_FUNC_NAME(uint, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     uint64_t in_val = child_res->get_uint();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObJsonUint j_uint(in_val);
     ObIJsonBase *j_base = &j_uint;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -3005,10 +2947,10 @@ CAST_FUNC_NAME(uint, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -3049,7 +2991,7 @@ CAST_FUNC_NAME(string, int)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     const bool is_str_int_cast = true;
     OZ(common_string_int(expr, expr.extra_, in_str, is_str_int_cast, res_datum));
   }
@@ -3060,7 +3002,7 @@ CAST_FUNC_NAME(string, uint)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     const bool is_str_int_cast = true;
     OZ(common_string_uint(expr, in_str, is_str_int_cast, res_datum));
   }
@@ -3072,7 +3014,7 @@ CAST_FUNC_NAME(string, float)
   EVAL_STRING_ARG()
   {
     float out_val = 0;
-    OZ(common_string_float(expr, ObString(child_res->len_, child_res->ptr_), out_val));
+    OZ(common_string_float(expr, ObString(child_res->length(), child_res->get_string().ptr()), out_val));
     OX(res_datum.set_float(out_val));
   }
   return ret;
@@ -3083,7 +3025,7 @@ CAST_FUNC_NAME(string, double)
   EVAL_STRING_ARG()
   {
     DEF_IN_OUT_TYPE();
-    ObString in_str = ObString(child_res->len_, child_res->ptr_);
+    ObString in_str = ObString(child_res->length(), child_res->get_string().ptr());
     OZ(common_string_double(expr, in_type, expr.args_[0]->datum_meta_.cs_type_, out_type, in_str, res_datum));
   }
   return ret;
@@ -3095,9 +3037,9 @@ CAST_FUNC_NAME(string, number)
   {
     number::ObNumber nmb;
     ObNumStackOnceAlloc tmp_alloc;
-    OZ(common_string_number(expr, ObString(child_res->len_, child_res->ptr_),
+    OZ(common_string_number(expr, ObString(child_res->length(), child_res->get_string().ptr()),
                             ctx.exec_ctx_.get_user_logging_ctx(), tmp_alloc, nmb));
-    OX(res_datum.set_number(nmb));
+    OZ(ObExprUtil::set_number(expr, ctx, res_datum, nmb));
   }
   return ret;
 }
@@ -3106,7 +3048,7 @@ CAST_FUNC_NAME(string, datetime)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_datetime(expr, ObString(child_res->len_, child_res->ptr_),
+    OZ(common_string_datetime(expr, ObString(child_res->length(), child_res->get_string().ptr()),
                               ctx, res_datum));
   }
   return ret;
@@ -3116,7 +3058,7 @@ CAST_FUNC_NAME(string, mdatetime)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_mdatetime(expr, ObString(child_res->len_, child_res->ptr_),
+    OZ(common_string_mdatetime(expr, ObString(child_res->length(), child_res->get_string().ptr()),
                               ctx, res_datum));
   }
   return ret;
@@ -3126,7 +3068,7 @@ CAST_FUNC_NAME(string, date)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_date(expr, ObString(child_res->len_, child_res->ptr_), res_datum));
+    OZ(common_string_date(expr, ObString(child_res->length(), child_res->get_string().ptr()), res_datum));
   }
   return ret;
 }
@@ -3135,7 +3077,7 @@ CAST_FUNC_NAME(string, mdate)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_mdate(expr, ObString(child_res->len_, child_res->ptr_), res_datum));
+    OZ(common_string_mdate(expr, ObString(child_res->length(), child_res->get_string().ptr()), res_datum));
   }
   return ret;
 }
@@ -3144,7 +3086,7 @@ CAST_FUNC_NAME(string, time)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_time(expr, ObString(child_res->len_, child_res->ptr_), res_datum));
+    OZ(common_string_time(expr, ObString(child_res->length(), child_res->get_string().ptr()), res_datum));
   }
   return ret;
 }
@@ -3153,7 +3095,7 @@ CAST_FUNC_NAME(string, year)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_year(expr, ObString(child_res->len_, child_res->ptr_), res_datum));
+    OZ(common_string_year(expr, ObString(child_res->length(), child_res->get_string().ptr()), res_datum));
   }
   return ret;
 }
@@ -3162,7 +3104,7 @@ CAST_FUNC_NAME(string, bit)
 {
   EVAL_STRING_ARG()
   {
-    OZ(common_string_bit(expr, ObString(child_res->len_, child_res->ptr_),
+    OZ(common_string_bit(expr, ObString(child_res->length(), child_res->get_string().ptr()),
                          ctx, res_datum));
   }
   return ret;
@@ -3172,11 +3114,11 @@ CAST_FUNC_NAME(string, string)
 {
   EVAL_STRING_ARG()
   {
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
     ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     bool has_set_res = false;
     OZ(common_string_string(expr, in_type, in_cs_type, out_type,
                             out_cs_type, in_str, ctx, res_datum, has_set_res));
@@ -3188,7 +3130,7 @@ CAST_FUNC_NAME(string, text)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     OZ(common_string_text(expr, in_str, ctx, NULL, res_datum));
   }
   return ret;
@@ -3198,7 +3140,7 @@ CAST_FUNC_NAME(string, otimestamp)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     OZ(common_string_otimestamp(expr, in_str, ctx, res_datum));
   }
   return ret;
@@ -3214,25 +3156,25 @@ CAST_FUNC_NAME(string, decimalint)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObDecimalIntBuilder res_val;
     if (OB_FAIL(common_string_decimalint(expr, in_str, ctx.exec_ctx_.get_user_logging_ctx(),
                                          res_val))) {
     } else {
-      res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
     }
   }
   return ret;
 }
 
 static int common_string_json(const ObExpr &expr,
-                              const ObObjType in_type,
+                              const SqlValueType in_type,
                               const ObString &in_str,
                               ObEvalCtx &ctx,
-                              ObDatum &res_datum)
+                              Datum &res_datum)
 {
   int ret = OB_SUCCESS;
-  ObObjType out_type = ObLongTextType;
+  SqlValueType out_type = ObLongTextType;
   ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
   ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
   bool has_set_res = false;
@@ -3325,7 +3267,7 @@ CAST_FUNC_NAME(string, json)
 {
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
-    ObDatum *child_res = NULL;
+    Datum *child_res = NULL;
     if (OB_FAIL(expr.args_[0]->eval(ctx, child_res))) {
     } else {
       ObString in_str = child_res->get_string();
@@ -3345,7 +3287,7 @@ CAST_FUNC_NAME(text, int)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -3359,7 +3301,7 @@ CAST_FUNC_NAME(text, uint)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -3373,7 +3315,7 @@ CAST_FUNC_NAME(text, float)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -3389,7 +3331,7 @@ CAST_FUNC_NAME(text, double)
   EVAL_STRING_ARG()
   {
     DEF_IN_OUT_TYPE();
-    ObString in_str = ObString(child_res->len_, child_res->ptr_);
+    ObString in_str = ObString(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -3404,12 +3346,12 @@ CAST_FUNC_NAME(text, number)
   {
     number::ObNumber nmb;
     ObNumStackOnceAlloc tmp_alloc;
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
     OZ(common_string_number(expr, in_str, ctx.exec_ctx_.get_user_logging_ctx(), tmp_alloc, nmb));
-    OX(res_datum.set_number(nmb));
+    OZ(ObExprUtil::set_number(expr, ctx, res_datum, nmb));
   }
   return ret;
 }
@@ -3418,14 +3360,14 @@ CAST_FUNC_NAME(text, decimalint)
 {
   EVAL_STRING_ARG()
   {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     ObDecimalIntBuilder res_val;
     if (OB_FAIL(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str))) {
     } else if (OB_FAIL(common_string_decimalint(expr, in_str, ctx.exec_ctx_.get_user_logging_ctx(), res_val))) {
     } else {
-      res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
     }
   }
   return ret;
@@ -3528,8 +3470,8 @@ CAST_FUNC_NAME(text, string)
 {
   EVAL_STRING_ARG()
   {
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
     ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
     const bool has_lob_header = expr.args_[0]->obj_meta_.has_lob_header();
@@ -3541,9 +3483,9 @@ CAST_FUNC_NAME(text, string)
     ObExprStrResAlloc res_alloc(expr, ctx);
     ObTextStringIter instr_iter(in_type, in_cs_type, child_res->get_string(), has_lob_header);
     // fast path for disk inrow lob
-    if (has_lob_header && child_res->len_ != 0 && ! child_res->get_lob_data().is_mem_loc_ && child_res->get_lob_data().in_row_) {
+    if (has_lob_header && child_res->length() != 0 && ! child_res->get_lob_data().is_mem_loc_ && child_res->get_lob_data().in_row_) {
       const ObLobCommon& lob = child_res->get_lob_data();
-      data.assign_ptr(lob.get_inrow_data_ptr(), static_cast<int32_t>(lob.get_byte_size(child_res->len_)));
+      data.assign_ptr(lob.get_inrow_data_ptr(), static_cast<int32_t>(lob.get_byte_size(child_res->length())));
     } else if (OB_FAIL(ObTextStringHelper::build_text_iter(instr_iter, ctx.exec_ctx_,
                                 is_same_charset ? reinterpret_cast<ObIAllocator *>(&res_alloc) : &temp_allocator,
                                 &temp_allocator))) {
@@ -3557,7 +3499,7 @@ CAST_FUNC_NAME(text, string)
       OZ(common_string_string(expr, in_type, in_cs_type, out_type,
                               out_cs_type, data, ctx, res_datum, has_set_res));
     }
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
   }
   return ret;
 }
@@ -3566,8 +3508,8 @@ CAST_FUNC_NAME(text, text)
 {
   EVAL_STRING_ARG()
   {
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
     ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
     const bool has_lob_header = expr.args_[0]->obj_meta_.has_lob_header();
@@ -3576,7 +3518,7 @@ CAST_FUNC_NAME(text, text)
     const bool is_cs_any = (in_cs_type == CS_TYPE_ANY || out_cs_type == CS_TYPE_ANY);
     const bool is_tiny_to_others = ((in_type == ObTinyTextType && out_type != ObTinyTextType)
                                    || (in_type != ObTinyTextType && out_type == ObTinyTextType));
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObString data;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -3739,10 +3681,10 @@ CAST_FUNC_NAME(number, number)
       if (OB_FAIL(buf_nmb.from(nmb, tmp_alloc))) {
       } else if (CAST_FAIL(numeric_negative_check(buf_nmb))) {
       } else {
-        res_datum.set_number(buf_nmb);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, buf_nmb);
       }
     } else {
-      res_datum.set_number(nmb);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, nmb);
     }
   }
   return ret;
@@ -3813,7 +3755,7 @@ CAST_FUNC_NAME(number, datetime)
     GET_SESSION()
     {
       const number::ObNumber nmb(child_res->get_number());
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -3902,9 +3844,9 @@ CAST_FUNC_NAME(number, lob)
   return ret;
 }
 
-static int common_number_json(const number::ObNumber &nmb, const ObObjType in_type,
+static int common_number_json(const number::ObNumber &nmb, const SqlValueType in_type,
                               const int16_t precision, const int16_t scale, const sql::ObExpr &expr,
-                              sql::ObEvalCtx &ctx, ObDatum &res_datum)
+                              sql::ObEvalCtx &ctx, Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   ObJsonDecimal j_dec(nmb, precision, scale);
@@ -3925,7 +3867,7 @@ CAST_FUNC_NAME(number, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     const number::ObNumber nmb(child_res->get_number());
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObPrecision prec = expr.args_[0]->datum_meta_.precision_;
     ObScale scale = expr.args_[0]->datum_meta_.scale_;
     ret = common_number_json(nmb, in_type, prec, scale, expr, ctx, res_datum);
@@ -3934,7 +3876,7 @@ CAST_FUNC_NAME(number, json)
 }
 
 static int common_string_geometry(const char *buf, int64_t length, const sql::ObExpr &expr,
-                                  sql::ObEvalCtx &ctx, ObDatum &res_datum)
+                                  sql::ObEvalCtx &ctx, Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   common::ObSrsCacheGuard srs_guard;
@@ -4015,7 +3957,7 @@ CAST_FUNC_NAME(float, float)
   {
     int warning = OB_SUCCESS;
     float val_float = child_res->get_float();
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (ObUFloatType == out_type && CAST_FAIL(numeric_negative_check(val_float))) {
     } else {
       res_datum.set_float(val_float);
@@ -4029,7 +3971,7 @@ CAST_FUNC_NAME(float, double)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(float, double, static_cast<double>(in_val));
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (ObUDoubleType == out_type && CAST_FAIL(numeric_negative_check(out_val))) {
     } else {
       res_datum.set_double(out_val);
@@ -4048,14 +3990,14 @@ CAST_FUNC_NAME(float, number)
     } else if (isinf(in_val)) {
       ret = OB_NUMERIC_OVERFLOW;
     } else {
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       int warning = OB_SUCCESS;
       ObNumStackOnceAlloc tmp_alloc;
       number::ObNumber number;
       if (ObUNumberType == out_type && CAST_FAIL(numeric_negative_check(in_val))) {
       } else if (OB_FAIL(common_floating_number(in_val, OB_GCVT_ARG_FLOAT, tmp_alloc, number, ctx, expr.extra_))) {
       } else {
-        res_datum.set_number(number);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
       }
     }
   }
@@ -4161,7 +4103,7 @@ CAST_FUNC_NAME(float, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     float in_val = child_res->get_float();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObJsonDouble j_float(in_val);
     ObIJsonBase *j_base = &j_float;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -4256,10 +4198,10 @@ CAST_FUNC_NAME(float, decimalint)
                                             out_prec, expr.extra_, res_val,
                                             ctx.exec_ctx_.get_user_logging_ctx()))) {
         } else {
-          res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+          ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
         }
       } else {
-        res_datum.set_decimal_int(decint, val_len);
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
       }
     }
   }
@@ -4318,7 +4260,7 @@ CAST_FUNC_NAME(double, double)
   {
     int warning = OB_SUCCESS;
     double val_double = child_res->get_double();
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (ObUDoubleType == out_type && CAST_FAIL(numeric_negative_check(val_double))) {
     } else {
       res_datum.set_double(val_double);
@@ -4331,7 +4273,7 @@ CAST_FUNC_NAME(double, number)
 {
   EVAL_ARG()
   {
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     double in_val = child_res->get_double();
     int warning = OB_SUCCESS;
     ObNumStackOnceAlloc tmp_alloc;
@@ -4339,7 +4281,7 @@ CAST_FUNC_NAME(double, number)
     if (ObUNumberType == out_type && CAST_FAIL(numeric_negative_check(in_val))) {
     } else if (OB_FAIL(common_floating_number(in_val, OB_GCVT_ARG_DOUBLE, tmp_alloc, number, ctx, expr.extra_))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -4365,10 +4307,10 @@ CAST_FUNC_NAME(double, decimalint)
                                           out_prec, expr.extra_, res_val,
                                           ctx.exec_ctx_.get_user_logging_ctx()))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -4498,7 +4440,7 @@ CAST_FUNC_NAME(double, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     double in_val = child_res->get_double();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObJsonDouble j_double(in_val);
     ObIJsonBase *j_base = &j_double;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -4667,7 +4609,7 @@ CAST_FUNC_NAME(datetime, double)
     {
       int64_t in_val = child_res->get_int();
       double out_val = 0.0;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -4709,7 +4651,7 @@ CAST_FUNC_NAME(datetime, float)
     {
       int64_t in_val = child_res->get_int();
       double out_val = 0.0;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -4750,7 +4692,7 @@ CAST_FUNC_NAME(datetime, number)
     GET_SESSION()
     {
       int warning = OB_SUCCESS;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       int64_t in_val = child_res->get_int();
       char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
       int64_t len = 0;
@@ -4769,7 +4711,7 @@ CAST_FUNC_NAME(datetime, number)
                       in_scale, buf, sizeof(buf), len, false))) {
         } else if (CAST_FAIL(number.from(buf, len, tmp_alloc, &res_precision, &res_scale))) {
         } else {
-          res_datum.set_number(number);
+          ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
         }
       }
     }
@@ -4796,7 +4738,7 @@ CAST_FUNC_NAME(mdatetime, number)
                                                     sizeof(buf), len, false))) {
       } else if (CAST_FAIL(number.from(buf, len, tmp_alloc, &res_precision, &res_scale))) {
       } else {
-        res_datum.set_number(number);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
       }
     }
   }
@@ -4812,8 +4754,8 @@ CAST_FUNC_NAME(datetime, datetime)
     {
       int64_t in_val = child_res->get_int();
       int64_t out_val = in_val;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -4847,8 +4789,8 @@ CAST_FUNC_NAME(mdatetime, datetime)
     {
       ObMySQLDateTime in_val = child_res->get_int();
       int64_t out_val = in_val.datetime_;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       int warning = OB_SUCCESS;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
@@ -4881,8 +4823,8 @@ CAST_FUNC_NAME(datetime, mdatetime)
     {
       int64_t in_val = child_res->get_int();
       ObMySQLDateTime out_val = in_val;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       ObDateSqlMode date_sql_mode;
@@ -4912,7 +4854,7 @@ CAST_FUNC_NAME(datetime, date)
     {
       int64_t in_val = child_res->get_int();
       int32_t out_val = 0;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -4998,7 +4940,7 @@ CAST_FUNC_NAME(datetime, time)
     {
       int64_t in_val = child_res->get_int();
       int64_t out_val = 0;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -5039,7 +4981,7 @@ CAST_FUNC_NAME(datetime, year)
     GET_SESSION()
     {
       DEF_IN_OUT_VAL(int64_t, uint8_t, 0);
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -5232,7 +5174,7 @@ CAST_FUNC_NAME(datetime, json)
     GET_SESSION()
     {
       int64_t in_val = child_res->get_datetime();
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObTime ob_time(DT_TYPE_DATETIME);
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
@@ -5277,7 +5219,7 @@ CAST_FUNC_NAME(datetime, decimalint)
       ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
       ObScale out_scale = expr.datum_meta_.scale_;
       ObPrecision out_prec = expr.datum_meta_.precision_;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (ObTimestampType == in_type) {
@@ -5295,10 +5237,10 @@ CAST_FUNC_NAME(datetime, decimalint)
                                             out_prec, expr.extra_, res_val,
                                             ctx.exec_ctx_.get_user_logging_ctx()))) {
         } else {
-          res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+          ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
         }
       } else {
-        res_datum.set_decimal_int(decint, int_bytes);
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, int_bytes);
       }
     }
   }
@@ -5321,7 +5263,7 @@ CAST_FUNC_NAME(mdatetime, decimalint)
       ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
       ObScale out_scale = expr.datum_meta_.scale_;
       ObPrecision out_prec = expr.datum_meta_.precision_;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(ObTimeConverter::mdatetime_to_str(in_val, NULL, in_scale, buf,
                                                    sizeof(buf), length, false))) {
@@ -5333,10 +5275,10 @@ CAST_FUNC_NAME(mdatetime, decimalint)
                                             out_prec, expr.extra_, res_val,
                                             ctx.exec_ctx_.get_user_logging_ctx()))) {
         } else {
-          res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+          ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
         }
       } else {
-        res_datum.set_decimal_int(decint, int_bytes);
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, int_bytes);
       }
     }
   }
@@ -5350,7 +5292,7 @@ CAST_FUNC_NAME(mdatetime, json)
     GET_SESSION()
     {
       ObMySQLDateTime in_val = child_res->get_mysql_datetime();
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObTime ob_time(DT_TYPE_MYSQL_DATETIME);
       if (OB_FAIL(ObTimeConverter::mdatetime_to_ob_time(in_val, ob_time))) {
       } else {
@@ -5394,7 +5336,7 @@ CAST_FUNC_NAME(date, int)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(int32_t, int64_t, 0);
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::date_to_int(in_val, out_val))) {
     } else if (out_type < ObInt32Type && CAST_FAIL(int_range_check(out_type, out_val, out_val))) {
     } else {
@@ -5409,7 +5351,7 @@ CAST_FUNC_NAME(mdate, int)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(ObMySQLDate, int64_t, 0);
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::mdate_to_int(in_val, out_val))) {
     } else if (out_type < ObInt32Type && CAST_FAIL(int_range_check(out_type, out_val, out_val))) {
     } else {
@@ -5426,7 +5368,7 @@ CAST_FUNC_NAME(date, uint)
   {
     DEF_IN_OUT_VAL(int32_t, uint64_t, 0);
     int64_t val_int = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::date_to_int(in_val, val_int))) {
     } else {
       out_val = static_cast<uint64_t>(val_int);
@@ -5445,7 +5387,7 @@ CAST_FUNC_NAME(mdate, uint)
   {
     DEF_IN_OUT_VAL(ObMySQLDate, uint64_t, 0);
     int64_t val_int = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::mdate_to_int(in_val, val_int))) {
     } else {
       out_val = static_cast<uint64_t>(val_int);
@@ -5525,7 +5467,7 @@ CAST_FUNC_NAME(date, number)
     } else if (CAST_FAIL(numeric_negative_check(out_val))) {
     } else if (OB_FAIL(number.from(out_val, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -5542,7 +5484,7 @@ CAST_FUNC_NAME(mdate, number)
     } else if (CAST_FAIL(numeric_negative_check(out_val))) {
     } else if (OB_FAIL(number.from(out_val, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -5554,7 +5496,7 @@ CAST_FUNC_NAME(date, datetime)
   {
     GET_SESSION()
     {
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
@@ -5578,7 +5520,7 @@ CAST_FUNC_NAME(date, mdatetime)
   {
     GET_SESSION()
     {
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObTimeConvertCtx cvrt_ctx(NULL, false);
       int32_t in_val = child_res->get_date();
       ObMySQLDateTime out_val = 0;
@@ -5597,8 +5539,8 @@ CAST_FUNC_NAME(mdate, datetime)
   {
     GET_SESSION()
     {
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       int warning = OB_SUCCESS;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
@@ -5624,7 +5566,7 @@ CAST_FUNC_NAME(mdate, mdatetime)
   {
     GET_SESSION()
     {
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObMySQLDate in_val = child_res->get_mysql_date();
       ObMySQLDateTime out_val = 0;
       if (OB_FAIL(ObTimeConverter::mdate_to_mdatetime(in_val, out_val))) {
@@ -5708,7 +5650,7 @@ CAST_FUNC_NAME(mdate, year)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(ObMySQLDate, uint8_t, 0);
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     if (CAST_FAIL(ObTimeConverter::mdate_to_year(in_val, out_val))) {
     } else {
       SET_RES_YEAR(out_val);
@@ -5825,7 +5767,7 @@ CAST_FUNC_NAME(date, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     int32_t in_val = child_res->get_date();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObTime ob_time(DT_TYPE_DATE);
     if (OB_FAIL(ObTimeConverter::date_to_ob_time(in_val, ob_time))) {
     } else {
@@ -5865,10 +5807,10 @@ CAST_FUNC_NAME(date, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -5896,10 +5838,10 @@ CAST_FUNC_NAME(mdate, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -5910,7 +5852,7 @@ CAST_FUNC_NAME(mdate, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     ObMySQLDate in_val = child_res->get_mysql_date();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObTime ob_time(DT_TYPE_MYSQL_DATE);
     if (OB_FAIL(ObTimeConverter::mdate_to_ob_time(in_val, ob_time))) {
     } else {
@@ -6007,7 +5949,7 @@ CAST_FUNC_NAME(year, int)
   {
     uint8_t in_val = child_res->get_year();
     int64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(common_year_int(expr, out_type, in_val, out_val))) {
     } else {
       res_datum.set_int(out_val);
@@ -6022,7 +5964,7 @@ CAST_FUNC_NAME(year, uint)
   {
     DEF_IN_OUT_VAL(uint8_t, uint64_t, 0);
     int64_t val_int = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::year_to_int(in_val, val_int))) {
     } else {
       out_val = static_cast<uint64_t>(val_int);
@@ -6074,7 +6016,7 @@ CAST_FUNC_NAME(year, number)
     if (OB_FAIL(common_year_int(expr, ObIntType, in_val, val_int))) {
     } else if (OB_FAIL(common_int_number(expr, val_int, tmp_alloc, number))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -6197,7 +6139,7 @@ CAST_FUNC_NAME(year, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     uint8_t in_val = child_res->get_year();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     int64_t full_year = 0;
     if (OB_FAIL(ObTimeConverter::year_to_int(in_val, full_year))) {
     } else {
@@ -6235,10 +6177,10 @@ CAST_FUNC_NAME(year, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -6285,7 +6227,7 @@ CAST_FUNC_NAME(bit, int)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(uint64_t, int64_t, static_cast<uint64_t>(in_val));
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (out_type < ObIntType
         && CM_NEED_RANGE_CHECK(expr.extra_)
         && CAST_FAIL(int_range_check(out_type, in_val, out_val))) {
@@ -6302,7 +6244,7 @@ CAST_FUNC_NAME(bit, uint)
   {
     int warning = OB_SUCCESS;
     uint64_t out_val = child_res->get_uint();
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (out_type < ObUInt64Type
         && CM_NEED_RANGE_CHECK(expr.extra_)
         && CAST_FAIL(uint_upper_check(out_type, out_val))) {
@@ -6342,7 +6284,7 @@ CAST_FUNC_NAME(bit, number)
     number::ObNumber number;
     if (OB_FAIL(number.from(in_val, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -6561,10 +6503,10 @@ CAST_FUNC_NAME(bit, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -6606,7 +6548,7 @@ CAST_FUNC_NAME(enumset, int)
   EVAL_ARG() {
     uint64_t in_val = child_res->get_enumset();
     int64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(common_uint_int(expr, out_type, in_val, ctx, out_val))) {
     } else {
       res_datum.set_int(out_val);
@@ -6654,7 +6596,7 @@ CAST_FUNC_NAME(enumset, number)
     number::ObNumber number;
     if (OB_FAIL(number.from(in_val, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -6700,10 +6642,10 @@ CAST_FUNC_NAME(enumset, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -6855,7 +6797,7 @@ CAST_FUNC_NAME(enumset_inner, int)
   EVAL_ARG() {
     ObEnumSetInnerValue inner_value;
     int64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(child_res->get_enumset_inner(inner_value))) {
     } else if (OB_FAIL(common_uint_int(expr, out_type, inner_value.numberic_value_,
                                        ctx, out_val))) {
@@ -6913,7 +6855,7 @@ CAST_FUNC_NAME(enumset_inner, number)
     if (OB_FAIL(child_res->get_enumset_inner(inner_value))) {
     } else if (OB_FAIL(number.from(inner_value.numberic_value_, tmp_alloc))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -7035,10 +6977,10 @@ CAST_FUNC_NAME(enumset_inner, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, val_len, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, val_len);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, val_len);
     }
   }
   return ret;
@@ -7049,7 +6991,7 @@ CAST_FUNC_NAME(time, int)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(int64_t, int64_t, 0);
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::time_to_int(in_val, out_val))) {
     } else if (out_type < ObInt32Type && CAST_FAIL(int_range_check(out_type, out_val, out_val))) {
     } else {
@@ -7065,7 +7007,7 @@ CAST_FUNC_NAME(time, uint)
   {
     DEF_IN_OUT_VAL(int64_t, uint64_t, 0);
     int64_t val_int = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::time_to_int(in_val, val_int))) {
     } else {
       out_val = static_cast<uint64_t>(val_int);
@@ -7084,7 +7026,7 @@ CAST_FUNC_NAME(time, float)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(int64_t, double, 0.0);
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::time_to_double(in_val, out_val))) {
     } else if (ObUFloatType == out_type && CAST_FAIL(numeric_negative_check(out_val))) {
     } else {
@@ -7099,7 +7041,7 @@ CAST_FUNC_NAME(time, double)
   EVAL_ARG()
   {
     DEF_IN_OUT_VAL(int64_t, double, 0.0);
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     if (OB_FAIL(ObTimeConverter::time_to_double(in_val, out_val))) {
     } else if (ObUDoubleType == out_type && CAST_FAIL(numeric_negative_check(out_val))) {
     } else {
@@ -7126,7 +7068,7 @@ CAST_FUNC_NAME(time, number)
     } else if (CAST_FAIL(number.from(buf, len, tmp_alloc, &res_precision, &res_scale))) {
     } else if (ObUNumberType == expr.datum_meta_.type_ && CAST_FAIL(numeric_negative_check(number))) {
     } else {
-      res_datum.set_number(number);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, number);
     }
   }
   return ret;
@@ -7140,7 +7082,7 @@ CAST_FUNC_NAME(time, datetime)
     {
       int64_t in_val = child_res->get_int();
       int64_t out_val = 0;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObPhysicalPlanCtx *phy_plan_ctx = ctx.exec_ctx_.get_physical_plan_ctx();
       int64_t cur_time = phy_plan_ctx ? phy_plan_ctx->get_cur_time().get_datetime() : 0;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
@@ -7166,7 +7108,7 @@ CAST_FUNC_NAME(time, mdatetime)
     {
       int64_t in_val = child_res->get_int();
       ObMySQLDateTime out_val = 0;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObPhysicalPlanCtx *phy_plan_ctx = ctx.exec_ctx_.get_physical_plan_ctx();
       int64_t cur_time = phy_plan_ctx ? phy_plan_ctx->get_cur_time().get_datetime() : 0;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
@@ -7218,7 +7160,7 @@ CAST_FUNC_NAME(time, mdate)
       int64_t cur_time = phy_plan_ctx ? phy_plan_ctx->get_cur_time().get_datetime() : 0;
       int64_t datetime_value = 0;
       int64_t in_val = child_res->get_time();
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObTimeConvertCtx cvrt_ctx(session->get_timezone_info(), false);
       if (OB_FAIL(ObTimeConverter::time_to_datetime(in_val, cur_time, session->get_timezone_info(),
                     datetime_value, ObDateTimeType))) {
@@ -7304,7 +7246,7 @@ CAST_FUNC_NAME(time, json)
   EVAL_ARG_FOR_CAST_TO_JSON()
   {
     int64_t in_val = child_res->get_int();
-    ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+    SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
     ObTime ob_time(DT_TYPE_TIME);
     if (OB_FAIL(ObTimeConverter::time_to_ob_time(in_val, ob_time))) {
     } else {
@@ -7346,10 +7288,10 @@ CAST_FUNC_NAME(time, decimalint)
                                           expr.extra_, res_val,
                                           ctx.exec_ctx_.get_user_logging_ctx()))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, int_bytes);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, int_bytes);
     }
   }
   return ret;
@@ -7397,7 +7339,7 @@ CAST_FUNC_NAME(otimestamp, datetime)
     GET_SESSION()
     {
       int64_t usec = 0;
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObOTimestampData in_val;
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
@@ -7422,7 +7364,7 @@ CAST_FUNC_NAME(otimestamp, string)
   {
     GET_SESSION()
     {
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObOTimestampData in_val;
       char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
       int64_t len = 0;
@@ -7492,7 +7434,7 @@ CAST_FUNC_NAME(otimestamp, text)
   {
     GET_SESSION()
     {
-      ObObjType in_type = expr.args_[0]->datum_meta_.type_;
+      SqlValueType in_type = expr.args_[0]->datum_meta_.type_;
       ObOTimestampData in_val;
       char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
       int64_t len = 0;
@@ -7673,7 +7615,7 @@ CAST_FUNC_NAME(json, int)
   {
     int warning = OB_SUCCESS;
     int64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     const uint64_t extra = CM_UNSET_STRING_INTEGER_TRUNC(CM_SET_WARN_ON_FAIL(expr.extra_));
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -7704,7 +7646,7 @@ CAST_FUNC_NAME(json, uint)
   {
     int warning = OB_SUCCESS;
     uint64_t out_val = 0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7735,7 +7677,7 @@ CAST_FUNC_NAME(json, double)
   {
     int warning = OB_SUCCESS;
     double out_val = 0.0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7765,7 +7707,7 @@ CAST_FUNC_NAME(json, float)
     int warning = OB_SUCCESS;
     double tmp_val = 0.0;
     float out_val = 0.0;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7790,8 +7732,8 @@ CAST_FUNC_NAME(json, float)
   return ret;
 }
 
-static int common_json_number(common::ObDatum &child_res, const ObExpr &expr,
-                              const ObObjType out_type, ObEvalCtx &ctx, ObIAllocator &alloc,
+static int common_json_number(common::Datum &child_res, const ObExpr &expr,
+                              const SqlValueType out_type, ObEvalCtx &ctx, ObIAllocator &alloc,
                               number::ObNumber &out_nmb)
 {
   int ret = OB_SUCCESS;
@@ -7826,7 +7768,7 @@ CAST_FUNC_NAME(json, number)
     if (OB_FAIL(common_json_number(*child_res, expr, expr.datum_meta_.type_, ctx, temp_allocator,
                                    out_nmb))) {
     } else {
-      res_datum.set_number(out_nmb);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, out_nmb);
     }
   }
   return ret;
@@ -7840,7 +7782,7 @@ CAST_FUNC_NAME(json, datetime)
     {
       int warning = OB_SUCCESS;
       int64_t out_val;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObString j_bin_str = child_res->get_string();
       ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
       common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7870,7 +7812,7 @@ CAST_FUNC_NAME(json, mdatetime)
   {
     int warning = OB_SUCCESS;
     ObMySQLDateTime out_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7905,7 +7847,7 @@ CAST_FUNC_NAME(json, date)
   {
     int warning = OB_SUCCESS;
     int32_t out_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7933,7 +7875,7 @@ CAST_FUNC_NAME(json, mdate)
   {
     int warning = OB_SUCCESS;
     ObMySQLDate out_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7967,7 +7909,7 @@ CAST_FUNC_NAME(json, time)
   {
     int warning = OB_SUCCESS;
     int64_t out_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -7996,7 +7938,7 @@ CAST_FUNC_NAME(json, year)
     int warning = OB_SUCCESS;
     uint8_t out_val = 0;
     int64_t int_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -8033,7 +7975,7 @@ CAST_FUNC_NAME(json, string)
   EVAL_STRING_ARG()
   {
     int warning = OB_SUCCESS;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     ObString j_bin_str = child_res->get_string();
@@ -8049,8 +7991,8 @@ CAST_FUNC_NAME(json, string)
         ret = OB_ERR_INVALID_JSON_VALUE_FOR_CAST;
         LOG_USER_ERROR(OB_ERR_INVALID_JSON_VALUE_FOR_CAST);
       } else {
-        ObObjType in_type = ObLongTextType;
-        ObObjType out_type = expr.datum_meta_.type_;
+        SqlValueType in_type = ObLongTextType;
+        SqlValueType out_type = expr.datum_meta_.type_;
         ObString temp_str_val(j_buf.length(), j_buf.ptr());
         // If you set json directly to binary, special handling needs to be done here, and the binary type in the code also needs to be changed
         ObCollationType in_cs_type = expr.args_[0]->datum_meta_.cs_type_;
@@ -8093,7 +8035,7 @@ CAST_FUNC_NAME(json, bit)
       ObJsonBin j_bin(j_bin_str.ptr(), j_bin_str.length(), &temp_allocator);
       ObIJsonBase *j_base = &j_bin;
       uint64_t out_val;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
 
       if (OB_FAIL(j_bin.reset_iter())) {
       } else if (CAST_FAIL(j_base->to_bit(out_val))) {
@@ -8113,7 +8055,7 @@ CAST_FUNC_NAME(json, otimestamp)
   {
     int warning = OB_SUCCESS;
     int64_t datetime_val;
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObString j_bin_str = child_res->get_string();
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -8221,7 +8163,7 @@ CAST_FUNC_NAME(json, decimalint)
     } else if (OB_FAIL(ObDatumCast::align_decint_precision_unsafe(decint, int_bytes,
                                                                   expected_int_bytes, res_val))) {
     } else {
-      res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
     }
   }
   return ret;
@@ -8330,12 +8272,12 @@ CAST_FUNC_NAME(geometry, number)
                                               tmp_alloc, nmb))) {
         ret = OB_ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD; // adapt mysql
       } else {
-        res_datum.set_number(nmb);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, nmb);
       }
     } else {
       number::ObNumber nmb;
       nmb.set_zero();
-      OX(res_datum.set_number(nmb));
+      OZ(ObExprUtil::set_number(expr, ctx, res_datum, nmb));
     }
   }
   return ret;
@@ -8523,14 +8465,14 @@ CAST_FUNC_NAME(geometry, decimalint)
                                                   ctx.exec_ctx_.get_user_logging_ctx(), res_val))) {
         ret = OB_ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD; // compatible with mysql
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
       ObDecimalIntBuilder res_val;
       res_val.from((int32_t)0);
       ObPrecision out_prec = expr.datum_meta_.precision_;
       res_val.extend(wide::ObDecimalIntConstValue::get_int_bytes_by_precision(out_prec));
-      res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
     }
   }
   return ret;
@@ -8539,7 +8481,7 @@ CAST_FUNC_NAME(geometry, decimalint)
 static int geom_copy_string(const ObExpr &expr,
                             ObString &src,
                             ObEvalCtx &ctx,
-                            ObDatum &res_datum)
+                            Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   char *out_ptr = NULL;
@@ -8556,12 +8498,8 @@ static int geom_copy_string(const ObExpr &expr,
       if (OB_FAIL(common_gis_wkb(expr, ctx, res_datum, src, IS_GEO_VERSION(version)))) {
       }
     } else {
-      if (expr.res_buf_len_ < len) {
-        if (OB_ISNULL(out_ptr = expr.get_str_res_mem(ctx, len))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-        }
-      } else {
-        out_ptr = const_cast<char*>(res_datum.ptr_);
+      if (OB_ISNULL(out_ptr = expr.get_reference_res_mem(ctx, len))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
       }
 
       if (OB_SUCC(ret)) {
@@ -8609,7 +8547,7 @@ CAST_FUNC_NAME(geometry, geometry)
     ObGeometry *src_tree = NULL;
     ObGeometry *dst_tree = NULL;
     ObString wkb = child_res->get_string();
-    ObObjType out_type = expr.datum_meta_.type_;
+    SqlValueType out_type = expr.datum_meta_.type_;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     ObGeoType dst_geo_type = ObGeoCastUtils::get_geo_type_from_cast_mode(expr.extra_);
@@ -8679,7 +8617,7 @@ CAST_FUNC_NAME(geometry, geometry)
 
 ////////////////////////////////////////////////////////////
 // XXX -> udt
-int cast_to_udt_not_support(const sql::ObExpr &expr, sql::ObEvalCtx &ctx, sql::ObDatum &res_datum)
+int cast_to_udt_not_support(const sql::ObExpr &expr, sql::ObEvalCtx &ctx, sql::Datum &res_datum)
 {
   UNUSED(ctx);
   UNUSED(res_datum);
@@ -8692,7 +8630,7 @@ int cast_to_udt_not_support(const sql::ObExpr &expr, sql::ObEvalCtx &ctx, sql::O
 ////////////////////////////////////////////////////////////
 // udt -> XXX
 
-int cast_udt_to_other_not_support(const sql::ObExpr &expr, sql::ObEvalCtx &ctx, sql::ObDatum &res_datum)
+int cast_udt_to_other_not_support(const sql::ObExpr &expr, sql::ObEvalCtx &ctx, sql::Datum &res_datum)
 {
   UNUSED(ctx);
   UNUSED(res_datum);
@@ -8722,7 +8660,7 @@ CAST_FUNC_NAME(collection, collection)
 {
   EVAL_STRING_ARG()
   {
-    const ObObjMeta &in_obj_meta = expr.args_[0]->obj_meta_;
+    const SqlTypeMeta &in_obj_meta = expr.args_[0]->obj_meta_;
     const uint16_t src_subschema_id = in_obj_meta.get_subschema_id();
     const uint16_t dst_subschema_id = expr.datum_meta_.get_subschema_id();
     ObSubSchemaValue src_meta;
@@ -8735,7 +8673,7 @@ CAST_FUNC_NAME(collection, collection)
       ret = OB_ERR_INVALID_TYPE_FOR_OP;
     } else if (src_subschema_id == dst_subschema_id) {
       ObExprStrResAlloc expr_res_alloc(expr, ctx);
-      if (OB_FAIL(res_datum.deep_copy(*child_res, expr_res_alloc))) {
+      if (OB_FAIL(ObExpr::clone_native_value(expr.get_sql_type(), *child_res, expr_res_alloc, res_datum))) {
       }
     } else {
       ObString blob_data = child_res->get_string();
@@ -8883,10 +8821,10 @@ CAST_FUNC_NAME(geometry, pl_extend)
 // Explicit cast, get accuracy information again from parse node (see ob_expr_cast.cpp)
 // It may be because the cast type inference is inaccurate, leading to the need to obtain it again from the parse node
 int get_accuracy_from_parse_node(const ObExpr &expr, ObEvalCtx &ctx,
-                                 ObAccuracy &accuracy, ObObjType &dest_type)
+                                 ObAccuracy &accuracy, SqlValueType &dest_type)
 {
   int ret = OB_SUCCESS;
-  ObDatum *dst_type_dat = NULL;
+  Datum *dst_type_dat = NULL;
   ObRawExprResType dst_type;
   if (OB_UNLIKELY(2 != expr.arg_cnt_) || OB_ISNULL(expr.args_) ||
       OB_ISNULL(expr.args_[1])) {
@@ -8896,7 +8834,7 @@ int get_accuracy_from_parse_node(const ObExpr &expr, ObEvalCtx &ctx,
     int64_t maxblen = ObCharset::CharConvertFactorNum;
     ParseNode node;
     node.value_ = dst_type_dat->get_int();
-    ObObjType obj_type = static_cast<ObObjType>(node.int16_values_[OB_NODE_CAST_TYPE_IDX]);
+    SqlValueType obj_type = static_cast<SqlValueType>(node.int16_values_[OB_NODE_CAST_TYPE_IDX]);
     dst_type.set_collation_type(static_cast<ObCollationType>(node.int16_values_[OB_NODE_CAST_COLL_IDX]));
     dst_type.set_type(obj_type);
     int64_t text_length = node.int32_values_[1];
@@ -8915,7 +8853,7 @@ int get_accuracy_from_parse_node(const ObExpr &expr, ObEvalCtx &ctx,
       text_length = dst_type.get_length();
     }
     dest_type = dst_type.get_type();
-    ObObjTypeClass dest_tc = ob_obj_type_class(dest_type);
+    SqlTypeClass dest_tc = sql_type_class(dest_type);
     if (ObStringTC == dest_tc) {
       // parser will abort all negative number
       // if length < 0 means DEFAULT_STR_LENGTH or OUT_OF_STR_LEN.
@@ -9159,10 +9097,10 @@ CAST_FUNC_NAME(number, decimalint)
       if (OB_FAIL(ObDatumCast::common_scale_decimalint(decint, int_bytes, in_scale, out_scale, out_prec,
                                           expr.extra_, res_val, ctx.exec_ctx_.get_user_logging_ctx()))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
-      res_datum.set_decimal_int(decint, int_bytes);
+      ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, decint, int_bytes);
     }
   }
   return ret;
@@ -9232,7 +9170,7 @@ CAST_ENUMSET_FUNC_NAME(string, enum)
 CAST_ENUMSET_FUNC_NAME(text, enum)
 {
   EVAL_STRING_ARG() {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -9355,7 +9293,7 @@ CAST_ENUMSET_FUNC_NAME(string, set)
 CAST_ENUMSET_FUNC_NAME(text, set)
 {
   EVAL_STRING_ARG() {
-    ObString in_str(child_res->len_, child_res->ptr_);
+    ObString in_str(child_res->length(), child_res->get_string().ptr());
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     OZ(get_text_full_data(expr, ctx, &temp_allocator, child_res, in_str));
@@ -9690,9 +9628,13 @@ CAST_FUNC_NAME(decimalint, int)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     char buffer[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t pos = 0;
-    if (OB_FAIL(wide::to_string(child_res->get_decimal_int(), child_res->get_int_bytes(),
+    if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                 expr.args_[0]->datum_meta_.scale_, buffer, sizeof(buffer), pos))) {
     } else {
       ObString num_str(pos, buffer);
@@ -9707,9 +9649,13 @@ CAST_FUNC_NAME(decimalint, uint)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     char buffer[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t pos = 0;
-    if (OB_FAIL(wide::to_string(child_res->get_decimal_int(), child_res->get_int_bytes(),
+    if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                 expr.args_[0]->datum_meta_.scale_, buffer, sizeof(buffer), pos))) {
     } else {
       ObString num_str(pos, buffer);
@@ -9725,9 +9671,13 @@ CAST_FUNC_NAME(decimalint, float)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     char buffer[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t pos = 0;
-    if (OB_FAIL(wide::to_string(child_res->get_decimal_int(), child_res->get_int_bytes(),
+    if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                 expr.args_[0]->datum_meta_.scale_, buffer, sizeof(buffer), pos))) {
     } else {
       ObString num_str(pos, buffer);
@@ -9745,9 +9695,13 @@ CAST_FUNC_NAME(decimalint, double)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     char buffer[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t pos = 0;
-    if (OB_FAIL(wide::to_string(child_res->get_decimal_int(), child_res->get_int_bytes(),
+    if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                 expr.args_[0]->datum_meta_.scale_, buffer, sizeof(buffer), pos))) {
     } else {
       ObString num_str(pos, buffer);
@@ -9764,11 +9718,15 @@ CAST_FUNC_NAME(decimalint, number)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     int warning = OB_SUCCESS;
     ObNumStackOnceAlloc tmp_alloc;
     number::ObNumber nmb;
     LOG_DEBUG("decimalint to number", K(lbt()));
-    if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(),
+    if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                 expr.args_[0]->datum_meta_.scale_, tmp_alloc, nmb))) {
     } else if (ObUNumberType == expr.datum_meta_.type_) {
       ObNumStackOnceAlloc tmp_alloc;
@@ -9776,10 +9734,10 @@ CAST_FUNC_NAME(decimalint, number)
       if (OB_FAIL(buf_nmb.from(nmb, tmp_alloc))) {
       } else if (CAST_FAIL(numeric_negative_check(buf_nmb))) {
       } else {
-        res_datum.set_number(buf_nmb);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, buf_nmb);
       }
     } else {
-      res_datum.set_number(nmb);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, nmb);
     }
   }
   return ret;
@@ -9846,11 +9804,15 @@ CAST_FUNC_NAME(decimalint, time)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t length = 0;
-    const ObDecimalInt *decint = child_res->get_decimal_int();
-    const int32_t int_bytes = child_res->get_int_bytes();
+    const ObDecimalInt *decint = coefficient.get_decimal_int();
+    const int32_t int_bytes = coefficient.get_int_bytes();
     if (OB_FAIL(wide::to_string(decint, int_bytes, in_scale, buf, sizeof(buf), length))) {
     } else if (OB_FAIL(common_string_time(expr, ObString(length, buf), res_datum))) {
     } else {
@@ -9864,11 +9826,15 @@ CAST_FUNC_NAME(decimalint, year)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t length = 0;
-    const ObDecimalInt *decint = child_res->get_decimal_int();
-    const int32_t int_bytes = child_res->get_int_bytes();
+    const ObDecimalInt *decint = coefficient.get_decimal_int();
+    const int32_t int_bytes = coefficient.get_int_bytes();
     bool is_neg = wide::is_negative(decint, int_bytes);
     if (is_neg) {
       // the year shouldn't accept a negative number, if we use the common_string_year.
@@ -9888,20 +9854,24 @@ CAST_FUNC_NAME(decimalint, datetime)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     GET_SESSION()
     {
       // TODO: cast directly into date
       ObNumStackOnceAlloc tmp_alloc;
       number::ObNumber nmb;
       ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObSolidifiedVarsGetter helper(expr, ctx, session);
       const common::ObTimeZoneInfo *tz_info_local = NULL;
       if (OB_FAIL(helper.get_time_zone_info(tz_info_local))) {
       } else {
         ObTimeConvertCtx cvt_ctx(tz_info_local, ObTimestampType == out_type);
         int64_t out_val;
-        if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(),
+        if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                     in_scale, tmp_alloc, nmb))) {
         } else {
           ret = common_number_datetime(nmb, cvt_ctx, out_val, expr.extra_, false);
@@ -9923,17 +9893,21 @@ CAST_FUNC_NAME(decimalint, mdatetime)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     GET_SESSION()
     {
       // TODO: cast directly into date
       ObNumStackOnceAlloc tmp_alloc;
       number::ObNumber nmb;
       ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
-      ObObjType out_type = expr.datum_meta_.type_;
+      SqlValueType out_type = expr.datum_meta_.type_;
       ObTimeConvertCtx cvrt_ctx(NULL, false);
 
       int64_t out_val;
-      if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(),
+      if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
                                   in_scale, tmp_alloc, nmb))) {
       } else {
         ret = common_number_datetime(nmb, cvrt_ctx, out_val, expr.extra_, true);
@@ -9954,13 +9928,17 @@ CAST_FUNC_NAME(decimalint, date)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     // TODO: cast directly into date
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     number::ObNumber nmb;
     ObNumStackOnceAlloc tmp_alloc;
     int32_t out_val = 0;
     int warning = OB_SUCCESS;
-    if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(), in_scale,
+    if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(), in_scale,
                                 tmp_alloc, nmb))) {
     } else {
       ret = common_number_date(nmb, expr.extra_, out_val, false);
@@ -9978,13 +9956,17 @@ CAST_FUNC_NAME(decimalint, mdate)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     // TODO: cast directly into date
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     number::ObNumber nmb;
     ObNumStackOnceAlloc tmp_alloc;
     int32_t out_val = 0;
     int warning = OB_SUCCESS;
-    if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(), in_scale,
+    if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(), in_scale,
                                 tmp_alloc, nmb))) {
     } else {
       ret = common_number_date(nmb, expr.extra_, out_val, true);
@@ -10002,11 +9984,15 @@ CAST_FUNC_NAME(decimalint, bit)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     int64_t length = 0;
-    const ObDecimalInt *decint = child_res->get_decimal_int();
-    int32_t int_bytes = child_res->get_int_bytes();
+    const ObDecimalInt *decint = coefficient.get_decimal_int();
+    int32_t int_bytes = coefficient.get_int_bytes();
     if (OB_FAIL(wide::to_string(decint, int_bytes, in_scale, buf, sizeof(buf), length))) {
     } else if (OB_FAIL(common_string_uint(expr, ObString(length, buf), false, res_datum))) {
     } else {
@@ -10028,12 +10014,16 @@ CAST_FUNC_NAME(decimalint, json)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     // TODO: cast directly into json
     ObNumStackOnceAlloc tmp_alloc;
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     ObPrecision in_precision = expr.args_[0]->datum_meta_.precision_;
     number::ObNumber nmb;
-    if (OB_FAIL(wide::to_number(child_res->get_decimal_int(), child_res->get_int_bytes(), in_scale,
+    if (OB_FAIL(wide::to_number(coefficient.get_decimal_int(), coefficient.get_int_bytes(), in_scale,
                                 tmp_alloc, nmb))) {
     } else {
       ret = common_number_json(nmb, expr.args_[0]->datum_meta_.type_, in_precision, in_scale, expr,
@@ -10047,17 +10037,21 @@ CAST_FUNC_NAME(decimalint, decimalint)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     int16_t in_scale = expr.args_[0]->datum_meta_.scale_;
     ObScale out_scale = expr.datum_meta_.scale_;
     ObPrecision out_prec = expr.datum_meta_.precision_;
     ObPrecision in_prec = expr.args_[0]->datum_meta_.precision_;
     if (ObDatumCast::need_scale_decimalint(in_scale, in_prec, out_scale, out_prec)) {
       ObDecimalIntBuilder res_val;
-      if (OB_FAIL(ObDatumCast::common_scale_decimalint(child_res->decimal_int_, child_res->len_, in_scale,
+      if (OB_FAIL(ObDatumCast::common_scale_decimalint(coefficient.get_decimal_int(), coefficient.get_int_bytes(), in_scale,
                                           out_scale, out_prec, expr.extra_, res_val,
                                           ctx.exec_ctx_.get_user_logging_ctx()))) {
       } else {
-        res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+        ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
       }
     } else {
       res_datum.set_datum(*child_res);
@@ -10070,10 +10064,14 @@ CAST_FUNC_NAME(decimalint, geometry)
 {
   EVAL_ARG()
   {
+    alignas(8) char coefficient_scratch[64];
+    common::ObDatum coefficient;
+    if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(
+        *child_res, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) { return ret; }
     char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
     ObScale in_scale = expr.args_[0]->datum_meta_.scale_;
     int64_t len = 0;
-    if (OB_FAIL(wide::to_string(child_res->get_decimal_int(), child_res->get_int_bytes(), in_scale,
+    if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(), in_scale,
                                 buf, sizeof(buf), len))) {
     } else if (OB_FAIL(common_string_geometry(buf, len, expr, ctx, res_datum))) {
     }
@@ -10114,15 +10112,15 @@ CAST_FUNC_NAME(enumset, enumset)
 // exclude varchar/char type
 int anytype_anytype_explicit(const sql::ObExpr &expr,
                              sql::ObEvalCtx &ctx,
-                             sql::ObDatum &res_datum)
+                             sql::Datum &res_datum)
 {
   EVAL_ARG()
   {
     int warning = OB_SUCCESS;
-    ObObjType out_type = ObMaxType;
+    SqlValueType out_type = ObMaxType;
     ObAccuracy out_acc;
     // tmp_datum is for datum_accuracy_check().
-    ObDatum tmp_datum = res_datum;
+    Datum tmp_datum = res_datum;
     if (OB_ISNULL(expr.inner_functions_) || 1 != expr.inner_func_cnt_ ||
                OB_ISNULL(expr.inner_functions_[0])) {
       ret = OB_ERR_UNEXPECTED;
@@ -10168,15 +10166,15 @@ int padding_char_for_cast(int64_t padding_cnt, const ObCollationType &padding_cs
 
 int anytype_to_varchar_char_explicit(const sql::ObExpr &expr,
                              sql::ObEvalCtx &ctx,
-                             sql::ObDatum &res_datum)
+                             sql::Datum &res_datum)
 {
   int ret = OB_SUCCESS;
   GET_SESSION()
   {
     int warning = OB_SUCCESS; // useless
     ObAccuracy out_acc;
-    ObObjType out_type = ObMaxType;
-    ObDatum tmp_datum = res_datum;
+    SqlValueType out_type = ObMaxType;
+    Datum tmp_datum = res_datum;
     bool is_from_pl = !expr.is_called_in_sql_;
     if (OB_ISNULL(expr.inner_functions_) || 1 != expr.inner_func_cnt_ ||
                OB_ISNULL(expr.inner_functions_[0])) {
@@ -10228,7 +10226,7 @@ int anytype_to_varchar_char_explicit(const sql::ObExpr &expr,
         }
 
         if (OB_SUCC(ret) && !has_result) {
-          ObString text(res_datum.len_, res_datum.ptr_);
+          ObString text = res_datum.get_string();
           ObCollationType out_cs_type = expr.datum_meta_.cs_type_;
           ObLengthSemantics ls = LS_CHAR;
           int32_t text_length = INT32_MAX;
@@ -10253,7 +10251,7 @@ int anytype_to_varchar_char_explicit(const sql::ObExpr &expr,
             if (0 == size) {
               res_datum.set_string(NULL, 0);
             } else {
-              res_datum.len_ = size;
+              ret = res_datum.set_reference(res_datum.get_reference(), size, res_datum.reference_flags());
             }
           } else if (out_acc.get_length() == text_length
                      || ObCharType != out_type
@@ -10291,9 +10289,9 @@ int anytype_to_varchar_char_explicit(const sql::ObExpr &expr,
 
 int bit_length_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
-                     const ObDatum &in_datum,
-                     ObDatum &res_datum,
+                     const SqlValueType type,
+                     const Datum &in_datum,
+                     Datum &res_datum,
                      int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10322,7 +10320,7 @@ int bit_length_check(const ObCastMode &cast_mode,
 
 int bit_length_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
+                     const SqlValueType type,
                      const int64_t idx,
                      const ObIVector &in_vec,
                      ObIVector &out_vec,
@@ -10354,9 +10352,9 @@ int bit_length_check(const ObCastMode &cast_mode,
 
 int raw_length_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
-                     const ObDatum &in_datum,
-                     ObDatum &res_datum,
+                     const SqlValueType type,
+                     const Datum &in_datum,
+                     Datum &res_datum,
                      int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10364,7 +10362,7 @@ int raw_length_check(const ObCastMode &cast_mode,
   UNUSED(type);
   UNUSED(warning);
   const ObLength max_accuracy_len = accuracy.get_length();
-  const int32_t str_len_byte = in_datum.len_;
+  const int32_t str_len_byte = in_datum.length();
   if (OB_UNLIKELY(str_len_byte > max_accuracy_len)) {
     ret = OB_OPERATE_OVERFLOW;
     LOG_WARN("char type length is too long", K(str_len_byte), K(max_accuracy_len));
@@ -10376,7 +10374,7 @@ int raw_length_check(const ObCastMode &cast_mode,
 
 int raw_length_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
+                     const SqlValueType type,
                      const int64_t idx,
                      const ObIVector &in_vec,
                      ObIVector &out_vec,
@@ -10448,9 +10446,9 @@ int time_usec_scale_check(const ObCastMode &cast_mode,
 
 int time_scale_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
-                     const ObDatum &in_datum,
-                     ObDatum &res_datum,
+                     const SqlValueType type,
+                     const Datum &in_datum,
+                     Datum &res_datum,
                      int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10477,7 +10475,7 @@ int time_scale_check(const ObCastMode &cast_mode,
 
 int time_scale_check(const ObCastMode &cast_mode,
                      const ObAccuracy &accuracy,
-                     const ObObjType type,
+                     const SqlValueType type,
                      const int64_t idx,
                      const ObIVector &in_vec,
                      ObIVector &out_vec,
@@ -10505,11 +10503,12 @@ int time_scale_check(const ObCastMode &cast_mode,
   return ret;
 }
 
-int otimestamp_scale_check(const ObCastMode &cast_mode,
+int otimestamp_scale_check(const ObExpr &expr, ObEvalCtx &ctx,
+                           const ObCastMode &cast_mode,
                            const ObAccuracy &accuracy,
-                           const ObObjType type,
-                           const ObDatum &in_datum,
-                           ObDatum &res_datum,
+                           const SqlValueType type,
+                           const Datum &in_datum,
+                           Datum &res_datum,
                            int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10528,7 +10527,7 @@ int otimestamp_scale_check(const ObCastMode &cast_mode,
       ObOTimestampData ot_data = ObTimeConverter::round_otimestamp(scale, in_val);
       if (ObTimeConverter::is_valid_otimestamp(ot_data.time_us_,
             static_cast<int32_t>(ot_data.time_ctx_.tail_nsec_))) {
-        res_datum.set_otimestamp_tiny(ot_data);
+        ret = ObExprUtil::set_otimestamp_tiny(expr, ctx, res_datum, ot_data);
       } else {
         res_datum.set_null();
       }
@@ -10541,7 +10540,7 @@ int otimestamp_scale_check(const ObCastMode &cast_mode,
 
 int otimestamp_scale_check(const ObCastMode &cast_mode,
                            const ObAccuracy &accuracy,
-                           const ObObjType type,
+                           const SqlValueType type,
                            const int64_t idx,
                            const ObIVector &in_vec,
                            ObIVector &out_vec,
@@ -10578,9 +10577,9 @@ int otimestamp_scale_check(const ObCastMode &cast_mode,
 
 int datetime_scale_check(const ObCastMode &cast_mode,
                          const ObAccuracy &accuracy,
-                         const ObObjType type,
-                         const ObDatum &in_datum,
-                         ObDatum &res_datum,
+                         const SqlValueType type,
+                         const Datum &in_datum,
+                         Datum &res_datum,
                          int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10618,7 +10617,7 @@ int datetime_scale_check(const ObCastMode &cast_mode,
 
 int datetime_scale_check(const ObCastMode &cast_mode,
                          const ObAccuracy &accuracy,
-                         const ObObjType type,
+                         const SqlValueType type,
                          const int64_t idx,
                          const ObIVector &in_vec,
                          ObIVector &out_vec,
@@ -10659,9 +10658,9 @@ int datetime_scale_check(const ObCastMode &cast_mode,
 
 int mdatetime_scale_check(const ObCastMode &cast_mode,
                           const ObAccuracy &accuracy,
-                          const ObObjType type,
-                          const ObDatum &in_datum,
-                          ObDatum &res_datum,
+                          const SqlValueType type,
+                          const Datum &in_datum,
+                          Datum &res_datum,
                           int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10699,7 +10698,7 @@ int mdatetime_scale_check(const ObCastMode &cast_mode,
 
 int mdatetime_scale_check(const ObCastMode &cast_mode,
                           const ObAccuracy &accuracy,
-                          const ObObjType type,
+                          const SqlValueType type,
                           const int64_t idx,
                           const ObIVector &in_vec,
                           ObIVector &out_vec,
@@ -10738,11 +10737,12 @@ int mdatetime_scale_check(const ObCastMode &cast_mode,
   return ret;
 }
 
-int number_range_check_v2(const ObCastMode &cast_mode,
+int number_range_check_v2(const ObExpr &expr, ObEvalCtx &ctx,
+                          const ObCastMode &cast_mode,
                           const ObAccuracy &accuracy,
-                          const ObObjType type,
-                          const ObDatum &in_datum,
-                          ObDatum &res_datum,
+                          const SqlValueType type,
+                          const Datum &in_datum,
+                          Datum &res_datum,
                           int &warning)
 {
   int ret = OB_SUCCESS;
@@ -10783,11 +10783,11 @@ int number_range_check_v2(const ObCastMode &cast_mode,
       ret = OB_ERR_UNEXPECTED;
     } else if (in_val <= *min_check_num) {
       cast_ret = OB_DATA_OUT_OF_RANGE;
-      res_datum.set_number(*min_num_mysql);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, *min_num_mysql);
       is_finish = true;
     } else if (in_val >= *max_check_num) {
       cast_ret = OB_DATA_OUT_OF_RANGE;
-      res_datum.set_number(*max_num_mysql);
+      ret = ObExprUtil::set_number(expr, ctx, res_datum, *max_num_mysql);
       is_finish = true;
     } else {
       if (OB_FAIL(out_val.from(in_val, out_val_alloc))) {
@@ -10801,7 +10801,7 @@ int number_range_check_v2(const ObCastMode &cast_mode,
         }
       }
       if (OB_SUCC(ret)) {
-        res_datum.set_number(out_val);
+        ret = ObExprUtil::set_number(expr, ctx, res_datum, out_val);
         is_finish = true;
       }
     }
@@ -10814,7 +10814,7 @@ int number_range_check_v2(const ObCastMode &cast_mode,
 
 int number_range_check_v2(const ObCastMode &cast_mode,
                           const ObAccuracy &accuracy,
-                          const ObObjType type,
+                          const SqlValueType type,
                           const int64_t idx,
                           const ObIVector &in_vec,
                           ObIVector &out_vec,
@@ -10890,17 +10890,17 @@ int number_range_check_v2(const ObCastMode &cast_mode,
 template <typename IN_TYPE>
 static int float_range_check(const ObCastMode &cast_mode,
                              const ObAccuracy &accuracy,
-                             const ObObjType type,
-                             const ObDatum &in_datum,
-                             ObDatum &res_datum,
+                             const SqlValueType type,
+                             const Datum &in_datum,
+                             Datum &res_datum,
                              int &warning)
 {
   int ret = OB_SUCCESS;
-  ObObjTypeClass type_class = ob_obj_type_class(type);
+  SqlTypeClass type_class = sql_type_class(type);
   if (OB_UNLIKELY(ObFloatTC != type_class && ObDoubleTC != type_class)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    IN_TYPE in_val = *(reinterpret_cast<const IN_TYPE*>(in_datum.ptr_));
+    IN_TYPE in_val = read_native_numeric<IN_TYPE>(in_datum);
     IN_TYPE out_val = in_val;
     if (ob_is_unsigned_type(type) && in_val < 0.0) {
       ret = OB_ERR_UNEXPECTED;
@@ -10923,14 +10923,14 @@ static int float_range_check(const ObCastMode &cast_mode,
 template <typename IN_TYPE>
 static int float_range_check(const ObCastMode &cast_mode,
                              const ObAccuracy &accuracy,
-                             const ObObjType type,
+                             const SqlValueType type,
                              const int64_t idx,
                              const ObIVector &in_vec,
                              ObIVector &out_vec,
                              int &warning)
 {
   int ret = OB_SUCCESS;
-  ObObjTypeClass type_class = ob_obj_type_class(type);
+  SqlTypeClass type_class = sql_type_class(type);
   if (OB_UNLIKELY(ObFloatTC != type_class && ObDoubleTC != type_class)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
@@ -10957,20 +10957,20 @@ static int float_range_check(const ObCastMode &cast_mode,
 int string_length_check(const ObExpr &expr,
                         const ObCastMode &cast_mode,
                         const ObAccuracy &accuracy,
-                        const ObObjType type,
+                        const SqlValueType type,
                         const ObCollationType cs_type,
                         ObEvalCtx &ctx,
-                        const ObDatum &in_datum,
-                        ObDatum &res_datum,
+                        const Datum &in_datum,
+                        Datum &res_datum,
                         int &warning)
 {
   int ret = OB_SUCCESS;
   UNUSED(expr);
   UNUSED(ctx);
   const ObLength max_accuracy_len = accuracy.get_length();
-  const int32_t str_len_byte = in_datum.len_;
+  const int32_t str_len_byte = in_datum.length();
   bool is_from_pl = !expr.is_called_in_sql_;
-  ObObjMeta meta;
+  SqlTypeMeta meta;
   meta.set_type_simple(type);
   meta.set_collation_type(cs_type);
   // remember not to change in_datum
@@ -10980,7 +10980,7 @@ int string_length_check(const ObExpr &expr,
     int &cast_ret = (CM_IS_ERROR_ON_FAIL(cast_mode))
                     ? ret
                     : warning;
-    const char *str = in_datum.ptr_;
+    const char *str = in_datum.get_string().ptr();
     int32_t str_len_char = -1;
     // In parse, if the length is greater than the maximum value of int32_t, length will be set to -1
     if (max_accuracy_len == -1) {
@@ -11059,7 +11059,7 @@ int string_length_check(const ObExpr &expr,
             trunc_len_byte = static_cast<int32_t>(ObCharset::strlen_byte_no_sp(cs_type,
                                                                   str, trunc_len_byte));
           }
-          res_datum.len_ = trunc_len_byte;
+          ret = res_datum.set_reference(res_datum.get_reference(), trunc_len_byte, res_datum.reference_flags());
         } else {
           // do nothing
         }
@@ -11076,7 +11076,7 @@ int string_length_check(const ObExpr &expr,
 int string_length_check(const ObExpr &expr,
                         const ObCastMode &cast_mode,
                         const ObAccuracy &accuracy,
-                        const ObObjType type,
+                        const SqlValueType type,
                         const ObCollationType cs_type,
                         ObEvalCtx &ctx,
                         const int64_t idx,
@@ -11090,7 +11090,7 @@ int string_length_check(const ObExpr &expr,
   const ObLength max_accuracy_len = accuracy.get_length();
   const int32_t str_len_byte = in_str.length();
   bool is_from_pl = !expr.is_called_in_sql_;
-  ObObjMeta meta;
+  SqlTypeMeta meta;
   meta.set_type_simple(type);
   meta.set_collation_type(cs_type);
   out_vec.set_payload_shallow(idx, in_str.ptr(), in_str.length());
@@ -11195,17 +11195,17 @@ int string_length_check(const ObExpr &expr,
 int text_length_check(const ObExpr &expr,
                       const ObCastMode &cast_mode,
                       const ObAccuracy &accuracy,
-                      const ObObjType type,
+                      const SqlValueType type,
                       const ObCollationType cs_type,
                       ObEvalCtx &ctx,
                       bool has_lob_header,
-                      const ObDatum &in_datum,
-                      ObDatum &res_datum,
+                      const Datum &in_datum,
+                      Datum &res_datum,
                       int &warning)
 {
   int ret = OB_SUCCESS;
   const ObLength max_accuracy_len = accuracy.get_length();
-  ObDatum tmp_in;
+  Datum tmp_in;
   if (expr.obj_meta_.is_lob_storage() && has_lob_header) {
     ObString inrow_data;
     ObLobLocatorV2 lob(in_datum.get_string(), has_lob_header);
@@ -11220,9 +11220,9 @@ int text_length_check(const ObExpr &expr,
                                            cs_type, ctx, tmp_in, res_datum, warning))) {
     } else {
       int32_t lob_handle_len = lob.size_ - inrow_data.length();
-      int32_t new_inrow_byte_len = lob_handle_len + res_datum.len_;
+      int32_t new_inrow_byte_len = lob_handle_len + res_datum.length();
       res_datum.set_datum(in_datum);
-      res_datum.len_ = new_inrow_byte_len;
+      ret = res_datum.set_reference(res_datum.get_reference(), new_inrow_byte_len, res_datum.reference_flags());
     }
   } else if (OB_FAIL(string_length_check(expr, cast_mode, accuracy, type,
                                          cs_type, ctx, in_datum, res_datum, warning))) {
@@ -11233,7 +11233,7 @@ int text_length_check(const ObExpr &expr,
 int text_length_check(const ObExpr &expr,
                       const ObCastMode &cast_mode,
                       const ObAccuracy &accuracy,
-                      const ObObjType type,
+                      const SqlValueType type,
                       const ObCollationType cs_type,
                       ObEvalCtx &ctx,
                       bool has_lob_header,
@@ -11274,20 +11274,20 @@ int datum_accuracy_check(const ObExpr &expr,
                          const uint64_t cast_mode,
                          ObEvalCtx &ctx,
                          bool has_lob_header,
-                         const ObDatum &in_datum,
-                         ObDatum &res_datum,
-                         int &warning)
+                         const Datum &in_datum,
+                         Datum &res_datum,
+                         int &warning, const SqlType *input_type)
 {
   ObAccuracy accuracy;
   accuracy.set_length(expr.max_length_);
   accuracy.set_scale(expr.datum_meta_.scale_);
-  const ObObjTypeClass &dst_tc = ob_obj_type_class(expr.datum_meta_.type_);
+  const SqlTypeClass &dst_tc = sql_type_class(expr.datum_meta_.type_);
   if (ObStringTC == dst_tc || ObTextTC == dst_tc || ObJsonTC == dst_tc) {
     accuracy.set_length_semantics(expr.datum_meta_.length_semantics_);
   } else {
     accuracy.set_precision(expr.datum_meta_.precision_);
   }
-  return datum_accuracy_check(expr, cast_mode, ctx, accuracy, has_lob_header, in_datum, res_datum, warning);
+  return datum_accuracy_check(expr, cast_mode, ctx, accuracy, has_lob_header, in_datum, res_datum, warning, input_type);
 }
 
 int vector_accuracy_check(const ObExpr &expr,
@@ -11302,7 +11302,7 @@ int vector_accuracy_check(const ObExpr &expr,
   ObAccuracy accuracy;
   accuracy.set_length(expr.max_length_);
   accuracy.set_scale(expr.datum_meta_.scale_);
-  const ObObjTypeClass &dst_tc = ob_obj_type_class(expr.datum_meta_.type_);
+  const SqlTypeClass &dst_tc = sql_type_class(expr.datum_meta_.type_);
   if (ObStringTC == dst_tc || ObTextTC == dst_tc || ObJsonTC == dst_tc) {
     accuracy.set_length_semantics(expr.datum_meta_.length_semantics_);
   } else {
@@ -11311,20 +11311,41 @@ int vector_accuracy_check(const ObExpr &expr,
   return vector_accuracy_check(expr, cast_mode, ctx, accuracy, has_lob_header, idx, in_vec, out_vec, warning);
 }
 
+int datum_accuracy_check_legacy_input(const ObExpr &expr, uint64_t cast_mode,
+    ObEvalCtx &ctx, const ObAccuracy &accuracy, bool has_lob_header,
+    const common::ObDatum &input, Datum &output, int &warning)
+{
+  int ret = OB_SUCCESS;
+  if (input.is_null()) { output.set_null(); }
+  else if (ob_is_decimal_int(expr.datum_meta_.type_)) {
+    ObDecimalIntBuilder checked;
+    if (OB_FAIL(check_decimalint_accuracy(cast_mode, input.get_decimal_int(), input.get_int_bytes(),
+        accuracy.get_precision(), accuracy.get_scale(), checked, warning))) {
+    } else {
+      ret = ObExprUtil::set_decimal_int(expr, ctx, output, checked.get_decimal_int(), checked.get_int_bytes());
+    }
+  } else {
+    Datum value;
+    if (OB_FAIL(expr.get_datum_copy_plan().import_legacy(input, value))) {
+    } else { ret = datum_accuracy_check(expr, cast_mode, ctx, accuracy, has_lob_header, value, output, warning); }
+  }
+  return ret;
+}
+
 int datum_accuracy_check(const ObExpr &expr,
                          const uint64_t cast_mode,
                          ObEvalCtx &ctx,
                          const ObAccuracy &accuracy,
                          bool has_lob_header,
-                         const ObDatum &in_datum,
-                         ObDatum &res_datum,
-                         int &warning)
+                         const Datum &in_datum,
+                         Datum &res_datum,
+                         int &warning, const SqlType *input_type)
 {
   int ret = OB_SUCCESS;
   if (!in_datum.is_null()) {
-    ObObjType type = expr.datum_meta_.type_;
+    SqlValueType type = expr.datum_meta_.type_;
     ObCollationType cs_type = expr.datum_meta_.cs_type_;
-    switch (ob_obj_type_class(type)) {
+    switch (sql_type_class(type)) {
       case ObFloatTC: {
         ret = float_range_check<float>(cast_mode, accuracy, type, in_datum,
                                        res_datum, warning);
@@ -11336,7 +11357,7 @@ int datum_accuracy_check(const ObExpr &expr,
         break;
       }
       case ObNumberTC: {
-        ret = number_range_check_v2(cast_mode, accuracy, type, in_datum,
+        ret = number_range_check_v2(expr, ctx, cast_mode, accuracy, type, in_datum,
                                     res_datum, warning);
         break;
       }
@@ -11346,7 +11367,7 @@ int datum_accuracy_check(const ObExpr &expr,
         break;
       }
       case ObOTimestampTC: {
-        ret = otimestamp_scale_check(cast_mode, accuracy, type, in_datum,
+        ret = otimestamp_scale_check(expr, ctx, cast_mode, accuracy, type, in_datum,
                                      res_datum, warning);
         break;
       }
@@ -11374,12 +11395,19 @@ int datum_accuracy_check(const ObExpr &expr,
       }
       case ObDecimalIntTC: {
         ObDecimalIntBuilder res_val;
-        ret = check_decimalint_accuracy(cast_mode, in_datum.get_decimal_int(),
-                                        in_datum.get_int_bytes(), accuracy.get_precision(),
-                                        accuracy.get_scale(), res_val, warning);
+        alignas(8) char coefficient_scratch[64];
+        common::ObDatum coefficient;
+        const DatumCopyPlan source_plan(input_type == nullptr ? expr.get_sql_type() : *input_type);
+        if (OB_FAIL(source_plan.get_decimal(
+            in_datum, coefficient, coefficient_scratch, sizeof(coefficient_scratch)))) {
+        } else {
+          ret = check_decimalint_accuracy(cast_mode, coefficient.get_decimal_int(),
+                                          coefficient.get_int_bytes(), accuracy.get_precision(),
+                                          accuracy.get_scale(), res_val, warning);
+        }
         if (OB_FAIL(ret)) {
         } else {
-          res_datum.set_decimal_int(res_val.get_decimal_int(), res_val.get_int_bytes());
+          ret = ObExprUtil::set_decimal_int(expr, ctx, res_datum, res_val.get_decimal_int(), res_val.get_int_bytes());
         }
         break;
       }
@@ -11412,9 +11440,9 @@ int vector_accuracy_check(const ObExpr &expr,
 {
   int ret = OB_SUCCESS;
   if (!in_vec.is_null(idx)) {
-    ObObjType type = expr.datum_meta_.type_;
+    SqlValueType type = expr.datum_meta_.type_;
     ObCollationType cs_type = expr.datum_meta_.cs_type_;
-    switch (ob_obj_type_class(type)) {
+    switch (sql_type_class(type)) {
       case ObFloatTC: {
         ret = float_range_check<float>(cast_mode, accuracy, type, idx, in_vec,
                                        out_vec, warning);
@@ -12578,7 +12606,7 @@ ObExpr::EvalEnumSetFunc OB_DATUM_CAST_MYSQL_ENUMSET_IMPLICIT[ObMaxTC][2] =
 
 int string_collation_check(const bool is_strict_mode,
                            const ObCollationType check_cs_type,
-                           const ObObjType str_type,
+                           const SqlValueType str_type,
                            ObString &str)
 {
   int ret = OB_SUCCESS;
@@ -12609,14 +12637,14 @@ int string_collation_check(const bool is_strict_mode,
 // Reserved for non-trivial string/text/lob cast checks. Detailed blob/nonblob
 // validation is handled by cast function selection and the concrete cast paths.
 // TODO by shaoge: lob_outrow processing is not yet complete.
-int ObDatumCast::check_can_cast(const ObObjType in_type,
+int ObDatumCast::check_can_cast(const SqlValueType in_type,
                                 const ObCollationType in_cs_type,
-                                const ObObjType out_type,
+                                const SqlValueType out_type,
                                 const ObCollationType out_cs_type)
 {
   int ret = OB_SUCCESS;
-  ObObjTypeClass in_tc = ob_obj_type_class(in_type);
-  ObObjTypeClass out_tc = ob_obj_type_class(out_type);
+  SqlTypeClass in_tc = sql_type_class(in_type);
+  SqlTypeClass out_tc = sql_type_class(out_type);
   const bool is_stringtext_tc_to_stringtext_tc =
     ((ObStringTC == in_tc || ObTextTC == in_tc || ObLobTC == in_tc) &&
     (ObStringTC == out_tc || ObTextTC == out_tc || ObLobTC == out_tc));
@@ -12635,9 +12663,9 @@ int ObDatumCast::check_can_cast(const ObObjType in_type,
 //      c. If input or output is cs_type_binary, it will call cast_eval_arg
 // 3. blob -> blob ok. Directly call cast_eval_arg
 // 4. blob -> !blob not ok. choose_cast_func will detect and report an error
-int ObDatumCast::is_trivial_cast(const ObObjType in_type,
+int ObDatumCast::is_trivial_cast(const SqlValueType in_type,
                                  const ObCollationType in_cs_type,
-                                 const ObObjType out_type,
+                                 const SqlValueType out_type,
                                  const ObCollationType out_cs_type,
                                  const ObCastMode &cast_mode,
                                  bool &is_trivial_cast)
@@ -12648,8 +12676,8 @@ int ObDatumCast::is_trivial_cast(const ObObjType in_type,
   ObCharsetType in_cs = ObCharset::charset_type_by_coll(in_cs_type);
   ObCharsetType out_cs = ObCharset::charset_type_by_coll(out_cs_type);
 
-  ObObjTypeClass in_tc = ob_obj_type_class(in_type);
-  ObObjTypeClass out_tc = ob_obj_type_class(out_type);
+  SqlTypeClass in_tc = sql_type_class(in_type);
+  SqlTypeClass out_tc = sql_type_class(out_type);
   const bool is_same_charset = (ob_is_string_type(in_type) &&
       ob_is_string_type(out_type) &&
       (in_cs == out_cs ||
@@ -12701,9 +12729,9 @@ int ObDatumCast::is_trivial_cast(const ObObjType in_type,
   return ret;
 }
 
-int ObDatumCast::get_implicit_cast_function(const ObObjType in_type,
+int ObDatumCast::get_implicit_cast_function(const SqlValueType in_type,
                                             const ObCollationType in_cs_type,
-                                            const ObObjType out_type,
+                                            const SqlValueType out_type,
                                             const ObCollationType out_cs_type,
                                             const int64_t cast_mode,
                                             ObExpr::EvalFunc &eval_func)
@@ -12717,17 +12745,17 @@ int ObDatumCast::get_implicit_cast_function(const ObObjType in_type,
   } else if (pass_cast) {
     eval_func = cast_eval_arg;
   } else {
-    ObObjTypeClass in_tc = ob_obj_type_class(in_type);
-    ObObjTypeClass out_tc = ob_obj_type_class(out_type);
+    SqlTypeClass in_tc = sql_type_class(in_type);
+    SqlTypeClass out_tc = sql_type_class(out_type);
     eval_func = OB_DATUM_CAST_MYSQL_IMPLICIT[in_tc][out_tc];
   }
 
   return ret;
 }
 
-int ObDatumCast::choose_cast_function(const ObObjType in_type,
+int ObDatumCast::choose_cast_function(const SqlValueType in_type,
                                       const ObCollationType in_cs_type,
-                                      const ObObjType out_type,
+                                      const SqlValueType out_type,
                                       const ObCollationType out_cs_type,
                                       const int64_t cast_mode,
                                       ObIAllocator &allocator,
@@ -12736,8 +12764,8 @@ int ObDatumCast::choose_cast_function(const ObObjType in_type,
 {
   int ret = OB_SUCCESS;
   just_eval_arg = false;
-  ObObjTypeClass in_tc = ob_obj_type_class(in_type);
-  ObObjTypeClass out_tc = ob_obj_type_class(out_type);
+  SqlTypeClass in_tc = sql_type_class(in_type);
+  SqlTypeClass out_tc = sql_type_class(out_type);
   if (OB_FAIL(check_can_cast(in_type, in_cs_type, out_type, out_cs_type))) {
   } else if (OB_FAIL(is_trivial_cast(in_type, in_cs_type, out_type,
                                      out_cs_type, cast_mode, just_eval_arg))) {
@@ -12783,8 +12811,8 @@ int ObDatumCast::choose_cast_function(const ObObjType in_type,
   return ret;
 }
 
-int ObDatumCast::get_enumset_cast_function(const common::ObObjTypeClass in_tc,
-    const common::ObObjType out_type, ObExpr::EvalEnumSetFunc &eval_func)
+int ObDatumCast::get_enumset_cast_function(const common::SqlTypeClass in_tc,
+    const common::SqlValueType out_type, ObExpr::EvalEnumSetFunc &eval_func)
 {
   int ret = OB_SUCCESS;
   // in_type can be NullType, out_type cannot be NullType
@@ -12797,116 +12825,418 @@ int ObDatumCast::get_enumset_cast_function(const common::ObObjTypeClass in_tc,
   return ret;
 }
 
-int ObDatumCast::cast_obj(ObEvalCtx &ctx, ObIAllocator &alloc, const ObObjType &dst_type,
-                          common::ObAccuracy &dst_acc,
-                          const ObCollationType &dst_cs_type, const ObObj &src_obj,
-                          ObObj &dst_obj)
+
+namespace
+{
+int bind_caster_type(ObExpr &expr, ObEvalCtx &ctx, const SqlTypeMeta &meta,
+                     const ObAccuracy &accuracy, uint16_t subschema_id,
+                     const ObIArray<ObString> *enum_values = nullptr)
 {
   int ret = OB_SUCCESS;
-  ObCastMode def_cm = CM_NONE;
-  ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
-  CK(OB_NOT_NULL(session));
-  if (OB_SUCC(ret)) {
-    ObPhysicalPlanCtx *phy_plan_ctx = ctx.exec_ctx_.get_physical_plan_ctx();
-    const ObDataTypeCastParams dtc_params = ObBasicSessionInfo::create_dtc_params(session);
-    if (OB_FAIL(ObSQLUtils::get_default_cast_mode(session->get_stmt_type(),
-                                                  session, def_cm))) {
+  ObIAllocator &owner = ctx.exec_ctx_.get_allocator();
+  if ((meta.is_enum_or_set() || meta.is_enumset_inner_type()) && enum_values != nullptr) {
+    SqlTypeSpec spec;
+    spec.attributes.set_meta_type(meta); spec.attributes.set_accuracy(accuracy);
+    spec.attributes.set_charset_type(meta.get_charset_type());
+    spec.form = meta.get_type() == ObEnumType || meta.get_type() == ObEnumInnerType
+        ? SqlTypeForm::Enum : SqlTypeForm::Set;
+    ObSEArray<ObString, 16> labels;
+    for (int64_t i = 0; OB_SUCC(ret) && i < enum_values->count(); ++i) { ret = labels.push_back(enum_values->at(i)); }
+    if (OB_SUCC(ret)) {
+      spec.labels = labels.empty() ? nullptr : &labels.at(0); spec.label_count = labels.count();
+      ObArenaAllocator temporary("CastTypePrep");
+      const SqlType *type = nullptr;
+      if (OB_FAIL(SqlType::create(spec, temporary, type))) {}
+      else { ret = expr.bind_sql_type(*type, owner); }
+    }
+  } else if (!meta.is_collection_sql_type() && meta.get_type() != ObUserDefinedSQLType
+      && !meta.is_enum_or_set() && !meta.is_enumset_inner_type()
+      && !meta.is_ext_sql_array() && !meta.is_pl_extend_type()) {
+    ret = expr.prepare_scalar_type(meta, accuracy, owner);
+  } else {
+    const SqlType *type = nullptr;
+    ObArenaAllocator temporary("CastTypePrep");
+    if (OB_FAIL(ObExprUtil::resolve_sql_type(ctx.exec_ctx_, meta, accuracy, subschema_id, temporary, type))) {}
+    else { ret = expr.bind_sql_type(*type, owner); }
+  }
+  return ret;
+}
+
+// Cross the prepared semantic layout to a synchronous physical view, then
+// use the existing resource-aware parameter cloner for the one snapshot
+// escaping the reusable native frame. Inline scalar wrappers own no bytes.
+int clone_caster_result(const ObExpr &expr, const Datum &value, DatumParameter &metadata,
+                        ObIAllocator &owner, DatumParameter &result)
+{
+  int ret = OB_SUCCESS;
+  const DatumCopyPlan plan = expr.get_datum_copy_plan();
+  alignas(8) char scratch[64];
+  common::ObDatum physical;
+  if (OB_FAIL(plan.legacy_view(value, physical, scratch, sizeof(scratch)))) {
+  } else if (OB_FAIL(metadata.assign_legacy_borrowed(physical, metadata.get_meta()))) {
+  } else {
+    if (value.is_null()) { metadata.set_null(); }
+    ret = clone_datum_parameter(metadata, result, owner);
+  }
+  return ret;
+}
+} // namespace
+
+int ObDatumCaster::init(ObExecContext &ctx, bool use_exec_frames)
+{
+  int ret = OB_SUCCESS;
+  if (!inited_) {
+    const int64_t parent_frames = use_exec_frames ? ctx.get_frame_cnt() : 0;
+    if (parent_frames > 0 && ctx.get_frames() == nullptr) {
+      ret = OB_INVALID_ARGUMENT;
     } else {
-      ObCastCtx cast_ctx(&alloc, &dtc_params, get_cur_time(phy_plan_ctx), def_cm,
-                         dst_cs_type, NULL, &dst_acc);
-      session->configure_obj_cast(
-          cast_ctx,
-          ctx.exec_ctx_.get_srs_provider(),
-          ctx.exec_ctx_.get_lob_read_service());
-      if (OB_FAIL(ObObjCaster::to_type(dst_type, cast_ctx, src_obj, dst_obj))) {
+      const int64_t expr_count = 4;
+      const int64_t res_buf_len = common::ObDatum::get_reserved_size(OBJ_DATUM_STRING);
+      const int64_t datum_slot = (sizeof(Datum) + sizeof(ObEvalInfo) + 7) & ~7;
+      const int64_t result_slot = sizeof(ObDynReserveBuf) + res_buf_len;
+      const int64_t frame_size = (datum_slot + result_slot) * expr_count;
+      int64_t total = 0;
+      auto reserve = [&](int64_t bytes) -> int64_t {
+        total = (total + 7) & ~7;
+        const int64_t offset = total; total += bytes; return offset;
+      };
+      const int64_t ctx_offset = reserve(sizeof(ObEvalCtx));
+      const int64_t expr_offset = reserve(sizeof(ObExpr) * expr_count);
+      const int64_t args_offset = reserve(sizeof(ObExpr *) * 7);
+      const int64_t frames_offset = reserve(sizeof(char *) * (parent_frames + 1));
+      const int64_t frame_offset = reserve(frame_size);
+      char *memory = static_cast<char *>(ctx.get_allocator().alloc(total));
+      if (OB_ISNULL(memory)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMSET(memory, 0, total);
+        allocation_ = memory;
+        eval_ctx_ = new (memory + ctx_offset) ObEvalCtx(ctx);
+        ObExpr *exprs = reinterpret_cast<ObExpr *>(memory + expr_offset);
+        for (int64_t i = 0; i < expr_count; ++i) { new (exprs + i) ObExpr(); }
+        cast_expr_ = exprs; extra_cast_expr_ = exprs + 1;
+        input_expr_ = exprs + 2; column_expr_ = exprs + 3;
+        ObExpr **args = reinterpret_cast<ObExpr **>(memory + args_offset);
+        cast_expr_->args_ = args; extra_cast_expr_->args_ = args + 1;
+        column_expr_->args_ = args + 2;
+        eval_ctx_->frames_ = reinterpret_cast<char **>(memory + frames_offset);
+        if (parent_frames > 0) {
+          MEMCPY(eval_ctx_->frames_, ctx.get_frames(), sizeof(char *) * parent_frames);
+        }
+        char *frame = memory + frame_offset;
+        eval_ctx_->frames_[parent_frames] = frame;
+        eval_ctx_->max_batch_size_ = 0;
+        eval_ctx_->set_batch_size(1); eval_ctx_->set_batch_idx(0);
+        for (int64_t i = 0; i < expr_count; ++i) {
+          ObExpr &expr = exprs[i];
+          expr.type_ = T_FUN_SYS_CAST;
+          expr.frame_idx_ = parent_frames;
+          expr.datum_off_ = datum_slot * i;
+          expr.eval_info_off_ = expr.datum_off_ + sizeof(Datum);
+          expr.dyn_buf_header_offset_ = datum_slot * expr_count + result_slot * i;
+          expr.res_buf_off_ = expr.dyn_buf_header_offset_ + sizeof(ObDynReserveBuf);
+          expr.res_buf_len_ = res_buf_len;
+          expr.arg_cnt_ = i < 2 ? 1 : (i == 2 ? 0 : 5);
+          expr.max_length_ = -1;
+          new (frame + expr.datum_off_) Datum();
+          new (frame + expr.eval_info_off_) ObEvalInfo();
+          ObDynReserveBuf *buffer = new (frame + expr.dyn_buf_header_offset_) ObDynReserveBuf();
+          buffer->magic_ = ObDynReserveBuf::MAGIC_NUM;
+          buffer->len_ = res_buf_len; buffer->mem_ = frame + expr.res_buf_off_;
+          expr.locate_datum_for_write(*eval_ctx_);
+        }
+        input_expr_->type_ = T_EXEC_VAR; // cached value, not a CAST with arguments
+        column_expr_->type_ = T_FUN_COLUMN_CONV;
+        inited_ = true;
       }
     }
   }
   return ret;
 }
 
-int ObDatumCaster::init(ObExecContext &ctx)
+int ObDatumCaster::to_column(const DatumParameter &source, const ObExprResType &type,
+    ObCastMode mode, ObIAllocator &owner, DatumParameter &result,
+    const ObIArray<ObString> *type_infos)
 {
   int ret = OB_SUCCESS;
-  if (!inited_) {
-    void *ctx_mem = NULL;
-    void *expr_mem = NULL;
-    void *extra_mem = NULL;
-    void *expr_args_mem = NULL;
-    void *extra_args_mem = NULL;
-    void *frame_mem = NULL;
-    void *frames_mem = NULL;
-    ObIAllocator &alloc = ctx.get_allocator();
-    int64_t res_buf_len = ObDatum::get_reserved_size(ObObjDatumMapType::OBJ_DATUM_STRING);
-      const int64_t datum_eval_info_size = sizeof(ObDatum) + sizeof(ObEvalInfo);
-    int64_t frame_size = (datum_eval_info_size + sizeof(ObDynReserveBuf) + res_buf_len) * 2;
-    int64_t frames_size = 0;
+  if (!inited_ || input_expr_ == nullptr || column_expr_ == nullptr || eval_ctx_ == nullptr) {
+    return OB_NOT_INIT;
+  }
+  if (native_cast_active_) { return OB_ERR_UNEXPECTED; }
+  struct FrameScope {
+    bool &active_;
+    ObExpr *expressions_;
+    ObEvalCtx &context_;
+    FrameScope(bool &active, ObExpr *expressions, ObEvalCtx &context)
+      : active_(active), expressions_(expressions), context_(context) { active_ = true; }
+    ~FrameScope() {
+      // A checked result may still borrow source or a temporary LOB reader.
+      // Only the final owner snapshot escapes this scope, including exceptions.
+      for (int64_t i = 0; i < 4; ++i) {
+        expressions_[i].locate_datum_for_write(context_).set_null();
+        expressions_[i].get_eval_info(context_).clear_evaluated_flag();
+      }
+      expressions_[3].extra_info_ = nullptr;
+      active_ = false;
+    }
+  } frame_scope(native_cast_active_, cast_expr_, *eval_ctx_);
+  if (is_invalid_sql_value_type(source.get_type()) || source.is_ext()
+      || is_invalid_sql_value_type(type.get_type()) || type.is_ext()) {
+    return OB_INVALID_ARGUMENT;
+  }
+  alignas(8) char source_scratch[64];
+  common::ObDatum physical_source;
+  if (OB_FAIL(source.export_legacy(physical_source, source_scratch, sizeof(source_scratch)))) { return ret; }
+  const SqlValueDatumMapType mapping = common::ObDatum::get_sql_value_datum_map_type(source.get_type());
+  if (!source.is_null()) {
+    const bool fixed = mapping != OBJ_DATUM_STRING && mapping != OBJ_DATUM_NUMBER
+        && mapping != OBJ_DATUM_DECIMALINT && mapping != OBJ_DATUM_NULL;
+    if ((physical_source.ptr_ == nullptr && physical_source.len_ != 0)
+        || (mapping == OBJ_DATUM_NUMBER && (physical_source.ptr_ == nullptr
+            || physical_source.len_ < sizeof(number::ObNumber::Desc)))
+        || (fixed && (physical_source.ptr_ == nullptr
+            || physical_source.len_ != common::ObDatum::get_reserved_size(mapping, source.get_precision())))) {
+      return OB_INVALID_ARGUMENT;
+    }
+  }
+  auto set_type = [&](ObExpr &expr, const SqlTypeMeta &meta, const ObAccuracy &accuracy,
+                      const ObIArray<ObString> *labels = nullptr) -> int {
+    expr.obj_meta_ = meta;
+    expr.datum_meta_ = ObDatumMeta(meta.get_type(), meta.get_collation_type(),
+                                  accuracy.get_scale(), accuracy.get_precision());
+    if (meta.is_numeric_type() || meta.is_temporal_type()) {
+      expr.obj_meta_.set_scale(accuracy.get_scale());
+    }
+    if (ob_is_string_or_lob_type(meta.get_type())) {
+      expr.datum_meta_.length_semantics_ = accuracy.get_length_semantics();
+    }
+    expr.obj_datum_map_ = common::ObDatum::get_sql_value_datum_map_type(meta.get_type());
+    expr.max_length_ = accuracy.get_length();
+    return bind_caster_type(expr, *eval_ctx_, meta, accuracy, meta.get_subschema_id(), labels);
+  };
+  eval_ctx_->set_batch_idx(0);
+  ObAccuracy input_accuracy = source.get_accuracy();
+  if (source.get_meta().is_numeric_type() || source.get_meta().is_temporal_type()) {
+    input_accuracy.set_scale(source.get_meta().get_scale());
+  }
+  OZ (set_type(*input_expr_, source.get_meta(), input_accuracy));
+  // Input raw metadata describes the actual value; accuracy describes its
+  // declaration and can differ after parameter assignment. In particular,
+  // interpreting DECIMAL bytes with the declared scale moves its decimal point.
+  input_expr_->obj_meta_ = source.get_meta();
+  if (source.get_meta().is_numeric_type() || source.get_meta().is_temporal_type()) {
+    input_expr_->datum_meta_.scale_ = source.get_meta().get_scale();
+  }
+  OZ (input_expr_->get_datum_copy_plan().import_legacy(physical_source, input_expr_->locate_expr_datum(*eval_ctx_)));
+  if (OB_SUCC(ret)) { input_expr_->get_eval_info(*eval_ctx_).evaluated_ = true; }
+  OZ (set_type(*column_expr_, type.get_sql_type_meta(), type.get_accuracy(), type_infos));
+  mode |= CM_COLUMN_CONVERT;
+  Datum *converted = nullptr;
+  const bool enum_target = ob_is_enum_or_set_type(type.get_type());
+  if (enum_target) {
+    CK (type_infos != nullptr);
+    OZ (to_type(column_expr_->datum_meta_, *type_infos, *input_expr_, mode, converted));
+  } else {
+    OZ (to_type(column_expr_->datum_meta_, *input_expr_, mode, converted, 0,
+                type.get_sql_type_meta().get_subschema_id(), type.get_accuracy().get_length()));
+  }
+  if (OB_SUCC(ret)) {
+    // Preserve the actual LOB-header state of the cast result, including the
+    // same-type, headerless-LOB fast path.
+    SqlTypeMeta cast_meta = converted == &input_expr_->locate_expr_datum(*eval_ctx_)
+        ? input_expr_->obj_meta_ : cast_expr_->obj_meta_;
+    Datum value = *converted;
+    OZ (input_expr_->bind_sql_type(converted == &input_expr_->locate_expr_datum(*eval_ctx_)
+        ? input_expr_->get_sql_type() : cast_expr_->get_sql_type(), eval_ctx_->exec_ctx_.get_allocator()));
+    input_expr_->obj_meta_ = cast_meta;
+    input_expr_->datum_meta_ = column_expr_->datum_meta_;
+    input_expr_->locate_expr_datum(*eval_ctx_) = value;
+    input_expr_->get_eval_info(*eval_ctx_).evaluated_ = true;
+    if (is_lob_storage(type.get_type())) {
+      column_expr_->obj_meta_.set_scale(cast_meta.get_scale());
+    }
+    ObEnumSetInfo info(eval_ctx_->exec_ctx_.get_allocator(), T_FUN_COLUMN_CONV);
+    info.cast_mode_ = mode;
+    if (enum_target) { OZ (info.str_values_.assign(*type_infos)); }
+    column_expr_->args_[4] = input_expr_;
+    column_expr_->extra_info_ = &info;
+    Datum &checked = column_expr_->locate_datum_for_write(*eval_ctx_);
+    OZ (ObExprColumnConv::column_convert(*column_expr_, *eval_ctx_, checked));
+    if (OB_SUCC(ret) && checked.is_null() && type.is_not_null_for_write()) {
+      ret = OB_BAD_NULL_ERROR;
+    }
+    if (OB_SUCC(ret)) {
+      DatumParameter output;
+      output.set_type_meta(column_expr_->obj_meta_);
+      output.set_accuracy(type.get_accuracy());
+      output.set_param_meta(type.get_sql_type_meta());
+      ret = clone_caster_result(*column_expr_, checked, output, owner, result);
+    }
+    column_expr_->extra_info_ = nullptr;
+  }
+  return ret;
+}
 
-    CK(OB_NOT_NULL(ctx.get_frames()));
-
-    OX(frames_size = sizeof(char*) * (ctx.get_frame_cnt() + 1));
-    OV(OB_NOT_NULL(ctx_mem = alloc.alloc(sizeof(ObEvalCtx))), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(frames_mem = alloc.alloc(frames_size)), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(frame_mem = alloc.alloc(frame_size)), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(expr_mem = alloc.alloc(sizeof(ObExpr))), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(extra_mem = alloc.alloc(sizeof(ObExpr))), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(expr_args_mem = alloc.alloc(sizeof(ObExpr*))), OB_ALLOCATE_MEMORY_FAILED);
-    OV(OB_NOT_NULL(extra_args_mem = alloc.alloc(sizeof(ObExpr*))), OB_ALLOCATE_MEMORY_FAILED);
-    OX(MEMCPY(frames_mem, ctx.get_frames(), sizeof(char*) * ctx.get_frame_cnt()));
-
-    if (OB_FAIL(ret)) {
+int ObDatumCaster::to_value(const DatumParameter &source, const ObExprResType &type,
+    ObCastMode mode, ObIAllocator &owner, DatumParameter &result,
+    const ObIArray<ObString> *type_infos)
+{
+  int ret = OB_SUCCESS;
+  if (!inited_ || input_expr_ == nullptr || column_expr_ == nullptr || eval_ctx_ == nullptr) {
+    return OB_NOT_INIT;
+  }
+  if (native_cast_active_) { return OB_ERR_UNEXPECTED; }
+  struct FrameScope {
+    bool &active_;
+    ObExpr *expressions_;
+    ObEvalCtx &context_;
+    FrameScope(bool &active, ObExpr *expressions, ObEvalCtx &context)
+      : active_(active), expressions_(expressions), context_(context) { active_ = true; }
+    ~FrameScope() {
+      for (int64_t i = 0; i < 4; ++i) {
+        expressions_[i].locate_datum_for_write(context_).set_null();
+        expressions_[i].get_eval_info(context_).clear_evaluated_flag();
+      }
+      active_ = false;
+    }
+  } scope(native_cast_active_, cast_expr_, *eval_ctx_);
+  common::ObDatum validated;
+  char extended_payload[DATUM_EXTEND_PAYLOAD_SIZE];
+  if (source.is_ext() || type.is_ext() || is_invalid_sql_value_type(type.get_type())) {
+    return OB_INVALID_ARGUMENT;
+  }
+  OZ (source.value_view().to_row_datum(validated, extended_payload));
+  if (OB_SUCC(ret)) {
+    eval_ctx_->set_batch_idx(0);
+    input_expr_->obj_meta_ = source.get_meta();
+    input_expr_->datum_meta_ = ObDatumMeta(source.get_type(), source.get_collation_type(),
+        source.get_meta().get_scale(), source.get_precision());
+    if (source.get_meta().is_collection_sql_type()) {
+      input_expr_->datum_meta_.cs_type_ = static_cast<ObCollationType>(source.get_subschema_id());
+    }
+    if (ob_is_string_or_lob_type(source.get_type())) {
+      input_expr_->datum_meta_.length_semantics_ = source.get_accuracy().get_length_semantics();
+    }
+    input_expr_->obj_datum_map_ = common::ObDatum::get_sql_value_datum_map_type(source.get_type());
+    input_expr_->max_length_ = source.get_length();
+    ObAccuracy input_accuracy = source.get_accuracy();
+    if (source.get_meta().is_numeric_type() || source.get_meta().is_temporal_type()) {
+      input_accuracy.set_scale(source.get_meta().get_scale());
+    }
+    OZ (bind_caster_type(*input_expr_, *eval_ctx_, source.get_meta(), input_accuracy,
+                        source.get_meta().get_subschema_id()));
+    OZ (input_expr_->get_datum_copy_plan().import_legacy(validated, input_expr_->locate_expr_datum(*eval_ctx_)));
+    if (OB_SUCC(ret)) { input_expr_->get_eval_info(*eval_ctx_).evaluated_ = true; }
+    ObDatumMeta target(type.get_type(), type.get_collation_type(),
+                       type.get_scale(), type.get_precision());
+    if (type.is_collection_sql_type()) {
+      target.cs_type_ = static_cast<ObCollationType>(type.get_subschema_id());
+    }
+    Datum *converted = nullptr;
+    if (ob_is_enum_or_set_type(type.get_type())) {
+      CK (type_infos != nullptr);
+      OZ (to_type(target, *type_infos, *input_expr_, mode, converted));
     } else {
-      // init eval_ctx_
-      char *frame = reinterpret_cast<char*>(frame_mem);
-      MEMSET(frame, 0, frame_size);
-      eval_ctx_ = new(ctx_mem) ObEvalCtx(ctx);
-      eval_ctx_->frames_ = reinterpret_cast<char**>(frames_mem);
-      eval_ctx_->frames_[ctx.get_frame_cnt()] = frame;
-      eval_ctx_->max_batch_size_ = 0;
-      eval_ctx_->set_batch_size(1);
-      eval_ctx_->set_batch_idx(0);
+      OZ (to_type(target, *input_expr_, mode, converted, 0,
+                  type.get_subschema_id(), type.get_length()));
+    }
+    if (OB_SUCC(ret)) {
+      DatumParameter candidate;
+      const bool unchanged = converted == &input_expr_->locate_expr_datum(*eval_ctx_);
+      candidate.set_type_meta(unchanged ? input_expr_->obj_meta_ : cast_expr_->obj_meta_);
+      if (!unchanged && (candidate.get_meta().is_decimal_int() || candidate.get_meta().is_temporal_type())) {
+        // Expression frames store scale in DatumMeta; a typed value must carry
+        // the actual coefficient/fractional scale beside its payload too.
+        candidate.get_meta().set_scale(cast_expr_->datum_meta_.scale_);
+      }
+      candidate.set_accuracy(type.get_accuracy());
+      candidate.set_param_meta(type.get_sql_type_meta());
+      ret = clone_caster_result(unchanged ? *input_expr_ : *cast_expr_, *converted, candidate, owner, result);
+    }
+  }
+  return ret;
+}
 
-      // init cast_expr_/extra_cast_expr and frame
-      cast_expr_ = new (expr_mem) ObExpr();
-      cast_expr_->args_ = reinterpret_cast<ObExpr**>(expr_args_mem);
-      extra_cast_expr_ = new (extra_mem) ObExpr();
-      extra_cast_expr_->args_ = reinterpret_cast<ObExpr**>(extra_args_mem);
-      ObExpr *exprs[2] = {cast_expr_, extra_cast_expr_};
-
-      int64_t data_off = datum_eval_info_size * 2;
-      const int64_t consume_size = res_buf_len + sizeof(ObDynReserveBuf);
-      for (int64_t i = 0; OB_SUCC(ret) && i < sizeof(exprs) / sizeof(ObExpr*); ++i) {
-        ObExpr *e = exprs[i];
-        e->type_ = T_FUN_SYS_CAST;
-        e->max_length_ = -1;
-        e->inner_func_cnt_ = 0;
-        e->inner_functions_ = NULL;
-        e->frame_idx_ = ctx.get_frame_cnt();
-        e->datum_off_ = datum_eval_info_size * i;
-        e->eval_info_off_ = e->datum_off_ + sizeof(ObDatum);
-        e->res_buf_len_ = res_buf_len;
-        data_off += consume_size;
-        e->res_buf_off_ = data_off - e->res_buf_len_;
-        e->dyn_buf_header_offset_ = e->res_buf_off_ - sizeof(ObDynReserveBuf);
-        e->arg_cnt_ = 1;
-
-        ObDatum *expr_datum = reinterpret_cast<ObDatum*>(frame + e->datum_off_);
-        expr_datum->ptr_ = frame + e->res_buf_off_;
-        ObDynReserveBuf *drb = reinterpret_cast<ObDynReserveBuf*>(
-                   frame + e->dyn_buf_header_offset_ + sizeof(ObDynReserveBuf));
-        drb->len_ = e->res_buf_len_;
-        drb->mem_ = frame + e->res_buf_off_;
+int ObDatumCaster::check_accuracy_and_collation(const DatumParameter &source,
+    const ObAccuracy &accuracy, ObCollationType collation, ObCastMode mode,
+    bool strict_characters, ObIAllocator &owner, DatumParameter &result, int *warning)
+{
+  int ret = OB_SUCCESS;
+  int local_warning = OB_SUCCESS;
+  if (!inited_ || column_expr_ == nullptr || eval_ctx_ == nullptr) { return OB_NOT_INIT; }
+  if (native_cast_active_) { return OB_ERR_UNEXPECTED; }
+  struct FrameScope {
+    bool &active_;
+    ObExpr &expression_;
+    ObEvalCtx &context_;
+    FrameScope(bool &active, ObExpr &expression, ObEvalCtx &context)
+      : active_(active), expression_(expression), context_(context) { active_ = true; }
+    ~FrameScope() {
+      expression_.locate_datum_for_write(context_).set_null();
+      expression_.get_eval_info(context_).clear_evaluated_flag();
+      active_ = false;
+    }
+  } scope(native_cast_active_, *column_expr_, *eval_ctx_);
+  common::ObDatum validated;
+  char extended_payload[DATUM_EXTEND_PAYLOAD_SIZE];
+  OZ (source.value_view().to_row_datum(validated, extended_payload));
+  DatumParameter candidate = source;
+  if (OB_SUCC(ret) && !candidate.is_null() && ob_is_string_type(candidate.get_type())) {
+    if (collation == CS_TYPE_BINARY) {
+      candidate.set_collation_type(collation);
+    } else {
+      ObString value;
+      int64_t well_formed_length = 0;
+      if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+              eval_ctx_->exec_ctx_, &owner, candidate, value))) {
+      } else if (OB_FAIL(ObCharset::well_formed_len(collation, value.ptr(), value.length(),
+                                                    well_formed_length))) {
+        if (strict_characters) {
+          ret = OB_ERR_INCORRECT_STRING_VALUE;
+        } else if (!candidate.has_lob_header()) {
+          ret = OB_SUCCESS;
+          candidate.set_collation_type(collation);
+          candidate.datum_.set_string(value.ptr(), static_cast<int32_t>(well_formed_length));
+        }
+      } else {
+        candidate.set_collation_type(collation);
       }
     }
-    OX(inited_ = true);
   }
+  if (OB_SUCC(ret)) {
+    eval_ctx_->set_batch_idx(0);
+    column_expr_->obj_meta_ = candidate.get_meta();
+    column_expr_->datum_meta_ = ObDatumMeta(candidate.get_type(), collation,
+                                            accuracy.get_scale(), accuracy.get_precision());
+    column_expr_->datum_meta_.length_semantics_ = accuracy.get_length_semantics();
+    column_expr_->obj_datum_map_ = common::ObDatum::get_sql_value_datum_map_type(candidate.get_type());
+    column_expr_->max_length_ = accuracy.get_length();
+    OZ (bind_caster_type(*column_expr_, *eval_ctx_, candidate.get_meta(), accuracy,
+                        candidate.get_meta().get_subschema_id()));
+    Datum &checked = column_expr_->locate_datum_for_write(*eval_ctx_);
+    alignas(8) char accuracy_scratch[64];
+    common::ObDatum accuracy_input;
+    OZ (candidate.export_legacy(accuracy_input, accuracy_scratch, sizeof(accuracy_scratch)));
+    OZ (datum_accuracy_check_legacy_input(*column_expr_, mode, *eval_ctx_, accuracy,
+                             candidate.has_lob_header(), accuracy_input, checked, local_warning));
+    if (OB_SUCC(ret)) {
+      candidate.set_accuracy(accuracy);
+      if (checked.is_null()) {
+        candidate.set_null();
+      } else if (candidate.get_meta().is_decimal_int()) {
+        candidate.get_meta().set_scale(accuracy.get_scale());
+      }
+      ret = clone_caster_result(*column_expr_, checked, candidate, owner, result);
+    }
+  }
+  if (warning != nullptr) { *warning = local_warning; }
   return ret;
 }
 
 int ObDatumCaster::to_type(const ObDatumMeta &dst_type,
                            const ObExpr &src_expr,
                            const ObCastMode &cm,
-                           ObDatum *&res,
+                           Datum *&res,
                            int64_t batch_idx,
                            const uint16_t subschema_id,
                            const int32_t max_length)
@@ -12980,7 +13310,7 @@ int ObDatumCaster::to_type(const ObDatumMeta &dst_type,
                            const ObIArray<ObString> &str_values,
                            const ObExpr &src_expr,
                            const ObCastMode &cm,
-                           ObDatum *&res,
+                           Datum *&res,
                            int64_t batch_idx)
 {
   int ret = OB_SUCCESS;
@@ -12989,7 +13319,7 @@ int ObDatumCaster::to_type(const ObDatumMeta &dst_type,
       OB_ISNULL(eval_ctx_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(!ob_is_enumset_tc(dst_type.type_)) ||
-             OB_UNLIKELY(ob_is_invalid_obj_type(src_type.type_))) {
+             OB_UNLIKELY(is_invalid_sql_value_type(src_type.type_))) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     // enum -> enum or set -> set will give error(see OB_DATUM_CAST_MYSQL_ENUMSET_IMPLICIT)
@@ -13006,10 +13336,10 @@ int ObDatumCaster::to_type(const ObDatumMeta &dst_type,
       ObDatumMeta extra_dst_type = src_type;
       extra_dst_type.cs_type_ = ObCharset::get_system_collation();
       if (OB_FAIL(setup_cast_expr(extra_dst_type, src_expr, cm, *extra_cast_expr_))) {
-      } else if (OB_FAIL(setup_cast_expr(dst_type, *extra_cast_expr_, cm, *cast_expr_))) {
+      } else if (OB_FAIL(setup_cast_expr(dst_type, *extra_cast_expr_, cm, *cast_expr_, 0, LENGTH_UNKNOWN_YET, &str_values))) {
       }
     } else {
-      if (OB_FAIL(setup_cast_expr(dst_type, src_expr, cm, *cast_expr_))) {
+      if (OB_FAIL(setup_cast_expr(dst_type, src_expr, cm, *cast_expr_, 0, LENGTH_UNKNOWN_YET, &str_values))) {
       }
     }
     if (OB_SUCC(ret)) {
@@ -13023,27 +13353,32 @@ int ObDatumCaster::to_type(const ObDatumMeta &dst_type,
   return ret;
 }
 
-int ObDatumCaster::destroy()
+int ObDatumCaster::get_result_type(const ObExpr &source, const Datum *result, const SqlType *&type) const
 {
   int ret = OB_SUCCESS;
-  if (inited_) {
-    if (OB_ISNULL(cast_expr_) || OB_ISNULL(extra_cast_expr_) || OB_ISNULL(eval_ctx_)) {
-      ret = OB_NOT_INIT;
-    } else {
-      inited_ = false;
-      ObIAllocator &alloc = eval_ctx_->exec_ctx_.get_allocator();
-      eval_ctx_->~ObEvalCtx();
-      // ~ObEvalCtx() is default deallocator, so free frames_ manually.
-      alloc.free(eval_ctx_->frames_);
-      alloc.free(eval_ctx_);
-      alloc.free(cast_expr_);
-      alloc.free(extra_cast_expr_);
-      eval_ctx_ = NULL;
-      cast_expr_ = NULL;
-      extra_cast_expr_ = NULL;
-    }
-  }
+  const SqlType *candidate = nullptr;
+  if (!inited_ || eval_ctx_ == nullptr || cast_expr_ == nullptr) { ret = OB_NOT_INIT; }
+  else if (result == nullptr) { ret = OB_INVALID_ARGUMENT; }
+  else if (result == &source.locate_expr_datum(*eval_ctx_)) { candidate = &source.get_sql_type(); }
+  else if (result == &cast_expr_->locate_expr_datum(*eval_ctx_)) { candidate = &cast_expr_->get_sql_type(); }
+  else { ret = OB_INVALID_ARGUMENT; }
+  if (OB_SUCC(ret)) { type = candidate; }
   return ret;
+}
+
+int ObDatumCaster::destroy()
+{
+  if (allocation_ != nullptr) {
+    ObIAllocator &allocator = eval_ctx_->exec_ctx_.get_allocator();
+    for (int64_t i = 0; i < 4; ++i) { (cast_expr_ + i)->~ObExpr(); }
+    eval_ctx_->~ObEvalCtx();
+    allocator.free(allocation_);
+  }
+  inited_ = false; eval_ctx_ = nullptr;
+  cast_expr_ = nullptr; extra_cast_expr_ = nullptr;
+  input_expr_ = nullptr; column_expr_ = nullptr; allocation_ = nullptr;
+  native_cast_active_ = false;
+  return OB_SUCCESS;
 }
 
 int ObDatumCaster::setup_cast_expr(const ObDatumMeta &dst_type,
@@ -13051,7 +13386,8 @@ int ObDatumCaster::setup_cast_expr(const ObDatumMeta &dst_type,
                                    const ObCastMode cm,
                                    ObExpr &cast_expr,
                                    const uint16_t subschema_id,
-                                   const int32_t max_length)
+                                   const int32_t max_length,
+                                   const ObIArray<ObString> *enum_values)
 {
   int ret = OB_SUCCESS;
   const ObDatumMeta &src_type = src_expr.datum_meta_;
@@ -13066,7 +13402,7 @@ int ObDatumCaster::setup_cast_expr(const ObDatumMeta &dst_type,
     ret = OB_ERR_UNEXPECTED;
   } else {
     cast_expr.datum_meta_ = dst_type;
-    cast_expr.obj_datum_map_ = ObDatum::get_obj_datum_map_type(dst_type.type_);
+    cast_expr.obj_datum_map_ = common::ObDatum::get_sql_value_datum_map_type(dst_type.type_);
     cast_expr.args_[0] = const_cast<ObExpr*>(&src_expr);
     cast_expr.extra_ = cm;
     cast_expr.obj_meta_.set_type(dst_type.type_);
@@ -13091,14 +13427,19 @@ int ObDatumCaster::setup_cast_expr(const ObDatumMeta &dst_type,
     if (ob_is_user_defined_pl_type(src_expr.obj_meta_.get_type()) && dst_type.type_ == ObUserDefinedSQLType) {
       cast_expr.obj_meta_.set_subschema_id(subschema_id);
     }
-    if (ob_is_double_tc(src_expr.datum_meta_.type_) &&
-        ob_is_string_tc(dst_type.type_) && CM_IS_COLUMN_CONVERT(cm) && max_length > 0) {
-      cast_expr.max_length_ = max_length;
-    }
+    // This frame is reused for different declarations. Never retain a length
+    // limit from a preceding DOUBLE/string or column conversion.
+    cast_expr.max_length_ = max_length;
     // implicit cast donot use these, so we set it all invalid.
     cast_expr.parents_ = NULL;
     cast_expr.parent_cnt_ = 0;
-    cast_expr.basic_funcs_ = NULL;
+    ObAccuracy accuracy;
+    if (ob_is_string_or_lob_type(dst_type.type_) || ob_is_collection_sql_type(dst_type.type_)) {
+      accuracy.set_length(max_length); accuracy.set_length_semantics(dst_type.length_semantics_);
+    } else {
+      accuracy.set_precision(dst_type.precision_); accuracy.set_scale(dst_type.scale_);
+    }
+    ret = bind_caster_type(cast_expr, *eval_ctx_, cast_expr.obj_meta_, accuracy, subschema_id, enum_values);
     cast_expr.get_eval_info(*eval_ctx_).clear_evaluated_flag();
   }
   return ret;
@@ -13136,10 +13477,13 @@ DEF_BATCH_CAST_FUNC(ObDecimalIntTC, ObIntTC)
         } else if (arg_dv.at(i)->is_null()) {
           result_dv.at(i)->set_null();
           eval_flags.set(i);
-        } else if (OB_FAIL(wide::to_string(arg_dv.at(i)->get_decimal_int(),
-                                           arg_dv.at(i)->get_int_bytes(), in_scale, buffer, buf_len,
-                                           pos))) {
         } else {
+          alignas(8) char coefficient_scratch[64];
+          common::ObDatum coefficient;
+          if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(*arg_dv.at(i), coefficient,
+              coefficient_scratch, sizeof(coefficient_scratch)))) { break; }
+          if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
+              in_scale, buffer, buf_len, pos))) { break; }
           ObString num_str(pos, buffer);
           if (OB_FAIL(common_string_int(expr, expr.extra_, num_str, false, *result_dv.at(i)))) {
           } else {
@@ -13173,10 +13517,13 @@ DEF_BATCH_CAST_FUNC(ObDecimalIntTC, ObUIntTC)
         } else if (arg_dv.at(i)->is_null()) {
           result_dv.at(i)->set_null();
           eval_flags.set(i);
-        } else if (OB_FAIL(wide::to_string(arg_dv.at(i)->get_decimal_int(),
-                                           arg_dv.at(i)->get_int_bytes(), in_scale, buffer, buf_len,
-                                           pos))) {
         } else {
+          alignas(8) char coefficient_scratch[64];
+          common::ObDatum coefficient;
+          if (OB_FAIL(expr.args_[0]->get_datum_copy_plan().get_decimal(*arg_dv.at(i), coefficient,
+              coefficient_scratch, sizeof(coefficient_scratch)))) { break; }
+          if (OB_FAIL(wide::to_string(coefficient.get_decimal_int(), coefficient.get_int_bytes(),
+              in_scale, buffer, buf_len, pos))) { break; }
           ObString num_str(pos, buffer);
           if (OB_FAIL(common_string_uint(expr, num_str, false, *result_dv.at(i)))) {
           } else {
@@ -13199,21 +13546,22 @@ DEF_BATCH_CAST_FUNC(ObDecimalIntTC, ObNumberTC)
       result_dv.at(i)->set_null();                                                                 \
       eval_flags.set(i);                                                                           \
     } else {                                                                                       \
-      const int_type *v = reinterpret_cast<const int_type *>(arg_dv.at(i)->get_decimal_int());     \
-      number::ObNumber tmp_nmb;                                                                    \
-      if (OB_FAIL(wide::to_number(*v, in_scale, alloc, tmp_nmb))) {                                \
+      int_type value;                                                                           \
+      number::ObNumber tmp_nmb;                                                                  \
+      if (OB_FAIL(ObExprUtil::get_decimal_int(*arg_dv.at(i), value))) {                              \
+      } else if (OB_FAIL(wide::to_number(value, in_scale, alloc, tmp_nmb))) {                                \
         LOG_WARN("wide::to_number failed", K(ret));                                                \
       } else if (ObUNumberType == expr.datum_meta_.type_) {                                        \
         int warning = OB_SUCCESS;                                                                  \
         if (CAST_FAIL(numeric_negative_check(tmp_nmb))) {                                          \
           LOG_WARN("numeric_negative_check failed", K(ret));                                       \
         } else {                                                                                   \
-          result_dv.at(i)->set_number(tmp_nmb);                                                    \
-          eval_flags.set(i);                                                                       \
+          ret = ObExprUtil::set_number(expr, ctx, *result_dv.at(i), tmp_nmb, i);                                                    \
+          if (OB_SUCC(ret)) { eval_flags.set(i); }                                                                       \
         }                                                                                          \
       } else {                                                                                     \
-        result_dv.at(i)->set_number(tmp_nmb);                                                      \
-        eval_flags.set(i);                                                                         \
+        ret = ObExprUtil::set_number(expr, ctx, *result_dv.at(i), tmp_nmb, i);                                                      \
+        if (OB_SUCC(ret)) { eval_flags.set(i); }                                                                         \
       }                                                                                            \
     }                                                                                              \
   }
@@ -13243,19 +13591,19 @@ DEF_BATCH_CAST_FUNC(ObDecimalIntTC, ObNumberTC)
           int ret = OB_SUCCESS;
           int64_t input = 0;
           if (dec_type == DECIMAL_INT_32) {
-            input = *reinterpret_cast<const int32_t *>(arg_dv.at(idx)->get_decimal_int());
+            input = arg_dv.at(idx)->get_decimal_int32();
           } else {
-            input = *reinterpret_cast<const int64_t *>(arg_dv.at(idx)->get_decimal_int());
+            input = arg_dv.at(idx)->get_decimal_int64();
           }
           if (OB_FAIL(wide::to_number(input, in_scale, (uint32_t *)digits, 3, tmp_nmb))) {
           } else if (ObUNumberType == expr.datum_meta_.type_) {
             int warning = OB_SUCCESS;
             if (CAST_FAIL(numeric_negative_check(tmp_nmb))) {
             } else {
-              result_dv.at(idx)->set_number(tmp_nmb);
+              ret = ObExprUtil::set_number(expr, ctx, *result_dv.at(idx), tmp_nmb, idx);
             }
           } else {
-            result_dv.at(idx)->set_number(tmp_nmb);
+            ret = ObExprUtil::set_number(expr, ctx, *result_dv.at(idx), tmp_nmb, idx);
           }
           return ret;
         };
@@ -13312,13 +13660,15 @@ namespace sql
 {
 using namespace common;
 
-int ob_obj_to_ob_time_with_date(const ObObj& obj,
+template <typename Value>
+int typed_value_to_ob_time_with_date(const Value &obj,
                                 const ObTimeZoneInfo* tz_info,
                                 ObTime& ob_time,
                                 const int64_t cur_ts_value,
                                 const ObDateSqlMode date_sql_mode /* = 0 */)
 {
   int ret = OB_SUCCESS;
+  if (obj.is_null()) { return OB_NOT_SUPPORTED; }
   switch (obj.get_type_class()) {
     case ObIntTC:
       // fallthrough.
@@ -13360,9 +13710,10 @@ int ob_obj_to_ob_time_with_date(const ObObj& obj,
     }
     case ObTextTC: {
       ObArenaAllocator lob_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);
-      ObString val;
+      ObString val = obj.get_string();
       if (OB_FAIL(common::lob_helper::read_real_string_data(
-              &lob_allocator, obj, val, nullptr))) {
+              &lob_allocator, obj.get_type(), obj.get_collation_type(),
+              obj.has_lob_header(), val, nullptr))) {
       } else if (OB_FAIL(ObTimeConverter::str_to_ob_time_with_date(val, ob_time,
                          NULL, date_sql_mode))) {
       }
@@ -13411,173 +13762,88 @@ int ob_obj_to_ob_time_with_date(const ObObj& obj,
   return ret;
 }
 
-
-int ob_obj_to_ob_time_without_date(const ObObj &obj, const ObTimeZoneInfo *tz_info, ObTime &ob_time)
+int datum_value_to_ob_time_with_date(const DatumValue &value, const ObTimeZoneInfo *timezone,
+    ObTime &result, int64_t current_timestamp, ObDateSqlMode mode)
 {
-  int ret = OB_SUCCESS;
-  switch (obj.get_type_class()) {
-    case ObIntTC:
-      // fallthrough.
-    case ObUIntTC: {
-      if (OB_FAIL(ObTimeConverter::int_to_ob_time_without_date(obj.get_int(), ob_time))) {
-      } else {
-        //When converting intTC to time in mysql, if hour exceeds 838, then time should be null, rather than the maximum value.
-        const int64_t time_max_val = TIME_MAX_VAL;    // 838:59:59 .
-        int64_t value = ObTimeConverter::ob_time_to_time(ob_time);
-        if (value > time_max_val) {
-          ret = OB_INVALID_DATE_VALUE;
-        }
-      }
-      break;
-    }
-    case ObOTimestampTC: {
-      ret = ObTimeConverter::otimestamp_to_ob_time(obj.get_type(), obj.get_otimestamp_value(), tz_info, ob_time);
-      break;
-    }
-    case ObDateTimeTC: {
-      ret = ObTimeConverter::datetime_to_ob_time(obj.get_datetime(),  (ObTimestampType == obj.get_type()) ? tz_info : NULL, ob_time);
-      break;
-    }
-    case ObDateTC: {
-      ret = ObTimeConverter::date_to_ob_time(obj.get_date(), ob_time);
-      break;
-    }
-    case ObMySQLDateTimeTC: {
-      ob_time.mode_ |= DT_TYPE_MYSQL_DATETIME;
-      ret = ObTimeConverter::mdatetime_to_ob_time(obj.get_mysql_datetime(), ob_time);
-      break;
-    }
-    case ObMySQLDateTC: {
-      ob_time.mode_ |= DT_TYPE_MYSQL_DATETIME;
-      ret = ObTimeConverter::mdate_to_ob_time(obj.get_mysql_date(), ob_time);
-      break;
-    }
-    case ObTimeTC: {
-      ret = ObTimeConverter::time_to_ob_time(obj.get_time(), ob_time);
-      break;
-    }
-    case ObTextTC: {
-      ObArenaAllocator lob_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);
-      ObString val;
-      if (OB_FAIL(common::lob_helper::read_real_string_data(
-              &lob_allocator, obj, val, nullptr))) {
-      } else if (OB_FAIL(ObTimeConverter::str_to_ob_time_without_date(val, ob_time))) {
-      }
-      break;
-    }
-    case ObStringTC: {
-      ret = ObTimeConverter::str_to_ob_time_without_date(obj.get_string(), ob_time);
-      if (OB_SUCC(ret)) {
-        int64_t value = ObTimeConverter::ob_time_to_time(ob_time);
-        int64_t tmp_value = value;
-        ObTimeConverter::time_overflow_trunc(value);
-        if (value != tmp_value) {
-          ObTimeConverter::time_to_ob_time(value, ob_time);
-        }
-      }
-      break;
-    }
-    case ObLobTC: {
-      ObString payload;
-      if (OB_FAIL(obj.get_string(payload))) {
-      } else {
-        ret = ObTimeConverter::str_to_ob_time_without_date(payload, ob_time);
-      }
-      break;
-    }
-    case ObDecimalIntTC:
-    case ObNumberTC: {
-      int64_t int_part = 0;
-      int64_t dec_part = 0;
-      number::ObNumber num;
-      sql::ObNumStackOnceAlloc tmp_alloc;
-      if (obj.is_decimal_int()) {
-        if (OB_FAIL(wide::to_number(obj.get_decimal_int(), obj.get_int_bytes(), obj.get_scale(), tmp_alloc, num))) {
-        }
-      } else {
-        num = obj.get_number();
-      }
-      if (OB_FAIL(ret)) {
-      } else if (!num.is_int_parts_valid_int64(int_part, dec_part)) {
-        ret = OB_INVALID_DATE_FORMAT;
-      } else {
-        if (OB_FAIL(ObTimeConverter::int_to_ob_time_without_date(int_part, ob_time, dec_part))) {
-        } else {
-          if ((!ob_time.parts_[DT_YEAR]) && (!ob_time.parts_[DT_MON]) && (!ob_time.parts_[DT_MDAY])) {
-            //When converting intTC to time in mysql, if it exceeds 838:59:59, then time should be null, rather than the maximum value.
-            const int64_t time_max_val = TIME_MAX_VAL;    // 838:59:59 .
-            int64_t value = ObTimeConverter::ob_time_to_time(ob_time);
-            if(value > time_max_val) {
-              ret = OB_INVALID_DATE_VALUE;
-            }
-          }
-        }
-      }
-      break;
-    }
-    default: {
-      ret = OB_NOT_SUPPORTED;
-    }
-  }
-  return ret;
+  return typed_value_to_ob_time_with_date(value, timezone, result, current_timestamp, mode);
 }
 
-
-int get_obj_zero_value(const ObObjType expect_type, ObCollationType expect_cs_type, ObObj &zero_obj)
+int get_datum_zero_value(const SqlValueType expect_type,
+                         ObCollationType expect_cs_type,
+                         ObIAllocator &allocator,
+                         DatumValue &zero_value)
 {
   int ret = OB_SUCCESS;
+  DatumValue candidate;
   if (ob_is_string_tc(expect_type)) {
-    zero_obj.set_string(expect_type, "");
+    candidate.datum_.set_string("", 0);
+    candidate.meta_.set_type(expect_type);
+    candidate.meta_.set_collation_level(CS_LEVEL_IMPLICIT);
   } else if (ob_is_text_tc(expect_type)) {
     if (ob_is_large_text(expect_type)) {
-      data_plane::set_zero_lob_value(expect_type, zero_obj);
+      data_plane::set_zero_lob_value(expect_type, candidate);
     } else { // tinytext
-      zero_obj.set_string(expect_type, "");
+      candidate.datum_.set_string("", 0);
+      candidate.meta_.set_type(expect_type);
+      candidate.meta_.set_collation_level(CS_LEVEL_IMPLICIT);
     }
   } else if (ob_is_int_tc(expect_type)) {
-    zero_obj.set_int(expect_type, 0);
+    ret = candidate.set_int(expect_type, 0, allocator);
   } else if (ob_is_uint_tc(expect_type)) {
-    zero_obj.set_uint(expect_type, 0);
+    ret = candidate.set_uint(expect_type, 0, allocator);
   } else if (ob_is_float_tc(expect_type)) {
-    zero_obj.set_float(expect_type, 0.0);
+    ret = candidate.set_float(0.0, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_type(expect_type); }
   } else if (ob_is_double_tc(expect_type)) {
-    zero_obj.set_double(expect_type, 0.0);
+    ret = candidate.set_double(expect_type, 0.0, allocator);
   } else if (ob_is_number_tc(expect_type)) {
     number::ObNumber value;
     value.set_zero();
-    zero_obj.set_number(expect_type, value);
+    ret = candidate.set_number(expect_type, value, allocator);
   } else if (ob_is_datetime_tc(expect_type)) {
-    zero_obj.set_datetime(expect_type, ObTimeConverter::ZERO_DATETIME);
+    ret = candidate.set_datetime(ObTimeConverter::ZERO_DATETIME, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_type(expect_type); }
   } else if (ob_is_date_tc(expect_type)) {
-    zero_obj.set_date(ObTimeConverter::ZERO_DATE);
+    ret = candidate.set_date(ObTimeConverter::ZERO_DATE, allocator);
   } else if (ob_is_time_tc(expect_type)) {
-    zero_obj.set_time(ObTimeConverter::ZERO_TIME);
+    ret = candidate.set_time(ObTimeConverter::ZERO_TIME, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_type(expect_type); }
   } else if (ob_is_year_tc(expect_type)) {
-    zero_obj.set_year(ObTimeConverter::ZERO_YEAR);
+    ret = candidate.set_year(ObTimeConverter::ZERO_YEAR, allocator);
   } else if (ob_is_bit_tc(expect_type)) {
-    zero_obj.set_bit(0);
+    ret = candidate.set_uint64(0, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_bit(); }
   } else if (ObEnumType == expect_type) {
-    zero_obj.set_enum(0);
+    ret = candidate.set_uint64(0, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_enum(); }
   } else if (ObSetType == expect_type) {
-    zero_obj.set_set(0);
+    ret = candidate.set_uint64(0, allocator);
+    if (OB_SUCC(ret)) { candidate.meta_.set_set(); }
   } else if (ob_is_otimestampe_tc(expect_type)) {
-    zero_obj.set_otimestamp_value(expect_type, ObOTimestampData());
+    char *buffer = static_cast<char *>(allocator.alloc(sizeof(ObOTimestampTinyData)));
+    if (OB_ISNULL(buffer)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      ret = candidate.datum_.set_otimestamp_tiny(ObOTimestampData(), buffer, sizeof(ObOTimestampTinyData));
+      if (OB_SUCC(ret)) { candidate.meta_.set_otimestamp_type(expect_type); }
+    }
   } else if (expect_type == ObJsonType) {
     static const ObJsonZeroVal JSON_ZERO;
-    zero_obj.set_json_value(
-        expect_type,
-        reinterpret_cast<const char *>(&JSON_ZERO),
-        ObJsonZeroVal::OB_JSON_ZERO_VAL_LENGTH);
-    zero_obj.set_has_lob_header();
+    candidate.datum_.set_string(reinterpret_cast<const char *>(&JSON_ZERO),
+                                ObJsonZeroVal::OB_JSON_ZERO_VAL_LENGTH);
+    candidate.meta_.set_json();
+    candidate.meta_.set_has_lob_header();
   } else if (expect_type == ObDecimalIntType) {
-    zero_obj.set_decimal_int(0, 0, nullptr);
+    ret = candidate.datum_.set_reference(nullptr, 0);
+    candidate.meta_.set_decimal_int(0);
   } else if (ob_is_mysql_date_tc(expect_type)) {
-    zero_obj.set_mysql_date(ObTimeConverter::MYSQL_ZERO_DATE);
+    ret = candidate.set_mysql_date(ObTimeConverter::MYSQL_ZERO_DATE, allocator);
   } else if (ob_is_mysql_datetime_tc(expect_type)) {
-    zero_obj.set_mysql_datetime(ObTimeConverter::MYSQL_ZERO_DATETIME);
+    ret = candidate.set_mysql_datetime(ObTimeConverter::MYSQL_ZERO_DATETIME, allocator);
   }
   if (OB_SUCC(ret)) {
-    zero_obj.set_collation_type(expect_cs_type);
+    candidate.meta_.set_collation_type(expect_cs_type);
+    zero_value = candidate;
   }
   return ret;
 }
