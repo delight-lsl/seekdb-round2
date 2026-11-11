@@ -6,12 +6,12 @@
 
 ## 1. 语言与版本
 
-- **实现语言**：Rust `1.93.1`（Edition `2021`）
-- **核心依赖**（均通过 `Cargo.lock` 锁定）：`serde`、`serde_json`、`crc32fast`
+- **实现语言**：Rust（Edition `2021`，兼容 Ubuntu `24.04` 源内 `1.75.0` 至服务端 `1.93.1`）
+- **核心依赖**（均通过 `Cargo.lock` 与 `vendor/` 离线锁定）：`serde`、`serde_json`、`crc32fast`
 - **目标平台**：Linux `x86_64`
 - **基础镜像**：
-  - 标准多阶段构建 `Dockerfile`：`rust:1.93.1-slim-bookworm`（编译期）→ `ubuntu:24.04`（运行期）
-  - 离线静态构建 `Dockerfile.musl`：`x86_64-unknown-linux-musl` 静态可执行文件 → `busybox:latest`
+  - 标准多阶段构建 `Dockerfile`：`ubuntu:24.04`（编译期：`cargo` + `rustc` 从源码 `--locked --offline` 构建）→ `ubuntu:24.04`（运行期）
+  - 离线静态构建 `Dockerfile.musl`：`x86_64-unknown-linux-musl` 静态可执行文件 → `busybox:latest`（供无 Docker Hub 访问的内网环境本地使用）
 
 ---
 

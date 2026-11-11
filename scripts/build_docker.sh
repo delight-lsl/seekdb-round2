@@ -8,14 +8,14 @@ IMAGE_NAME="${1:-minivectordb:latest}"
 EXPORT_TAR="${2:-minivectordb.tar}"
 
 echo "[build] Ensuring Cargo.lock is up-to-date..."
-cargo check --quiet
+cargo check --quiet --locked --offline
 
-if docker image inspect rust:1.93.1-slim-bookworm >/dev/null 2>&1 && docker image inspect ubuntu:24.04 >/dev/null 2>&1; then
-    echo "[build] Building from source with standard multi-stage Dockerfile (rust:1.93.1-slim-bookworm -> ubuntu:24.04)..."
+if docker image inspect ubuntu:24.04 >/dev/null 2>&1 || { command -v timeout >/dev/null 2>&1 && timeout 10 docker pull ubuntu:24.04 >/dev/null 2>&1; }; then
+    echo "[build] Building from source with multi-stage Ubuntu 24.04 Dockerfile..."
     docker build -t "$IMAGE_NAME" -f Dockerfile .
 else
-    echo "[build] Base images not cached locally; building static x86_64-unknown-linux-musl binary with Rust $(rustc --version)..."
-    cargo build --release --target x86_64-unknown-linux-musl --locked
+    echo "[build] ubuntu:24.04 unavailable; building static x86_64-unknown-linux-musl binary with Rust $(rustc --version)..."
+    cargo build --release --target x86_64-unknown-linux-musl --locked --offline
     echo "[build] Packaging minimal multi-stage Docker image via Dockerfile.musl..."
     docker build -t "$IMAGE_NAME" -f Dockerfile.musl .
 fi

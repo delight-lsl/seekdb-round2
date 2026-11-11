@@ -60,7 +60,7 @@ struct OkQueryResp {
 }
 
 fn emit_json<T: Serialize>(out: &mut impl Write, val: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *out, val).map_err(io::Error::other)?;
+    serde_json::to_writer(&mut *out, val).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     out.write_all(b"\n")?;
     out.flush()
 }

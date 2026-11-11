@@ -3,3 +3,4 @@ target/**
 .verify_tmp/
 *.tar
 .git/
+minivectordb

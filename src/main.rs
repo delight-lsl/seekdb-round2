@@ -1,34 +1,36 @@
 use minivectordb::cli::protocol::run_stdio_loop;
 use minivectordb::sql::executor::Database;
 
-fn resolve_data_dir() -> Result<String, String> {
+fn resolve_data_dir() -> String {
+    let mut data_dir = std::env::var("VECTORDB_DATA_DIR").unwrap_or_else(|_| "/data".to_string());
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--data-dir" {
-            let val = args
-                .next()
-                .ok_or_else(|| "missing path after --data-dir".to_string())?;
-            return Ok(val);
-        } else if let Some(val) = arg.strip_prefix("--data-dir=") {
-            if val.is_empty() {
-                return Err("empty path in --data-dir=".to_string());
+        if arg == "--data-dir" || arg == "-d" || arg == "--data_dir" {
+            if let Some(val) = args.next() {
+                if !val.is_empty() {
+                    data_dir = val;
+                }
             }
-            return Ok(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--data-dir=") {
+            if !val.is_empty() {
+                data_dir = val.to_string();
+            }
+        } else if let Some(val) = arg.strip_prefix("--data_dir=") {
+            if !val.is_empty() {
+                data_dir = val.to_string();
+            }
+        } else if arg == "minivectordb" || arg.ends_with("/minivectordb") {
+            // Binary name passed as first argument when docker run overrides CMD
+            continue;
         } else {
-            return Err(format!("unknown argument: {}", arg));
+            eprintln!("ignoring unrecognized argument: {}", arg);
         }
     }
-    Ok(std::env::var("VECTORDB_DATA_DIR").unwrap_or_else(|_| "/data".to_string()))
+    data_dir
 }
 
 fn main() {
-    let data_dir = match resolve_data_dir() {
-        Ok(d) => d,
-        Err(msg) => {
-            eprintln!("argument error: {}", msg);
-            std::process::exit(2);
-        }
-    };
+    let data_dir = resolve_data_dir();
     let mut db = match Database::open(&data_dir) {
         Ok(db) => db,
         Err(e) => {
