@@ -27,5 +27,5 @@ RUN chmod 755 /app/minivectordb && \
 
 VOLUME ["/data"]
 
-ENTRYPOINT ["/minivectordb"]
+ENTRYPOINT ["/app/minivectordb"]
 CMD ["--data-dir", "/data"]
