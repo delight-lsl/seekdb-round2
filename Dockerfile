@@ -10,13 +10,13 @@ COPY src ./src
 RUN cargo build --release --locked --offline
 
 # Stage 2: Ubuntu 24.04 runtime image (matching section 4.2.1)
-FROM ubuntu:24.04
+FROM centos:7
 
-WORKDIR /app
-COPY --from=builder --chmod=755 /build/target/release/minivectordb /app/minivectordb
+WORKDIR /
+COPY --from=builder --chmod=755 minivectordb /minivectordb
 
 RUN mkdir -p /data && chmod 1777 /data
 VOLUME ["/data"]
 
-ENTRYPOINT ["/app/minivectordb"]
+ENTRYPOINT ["/minivectordb"]
 CMD ["--data-dir", "/data"]
