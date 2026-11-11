@@ -1,0 +1,13 @@
+# Offline/local multi-stage Dockerfile packaging static x86_64-unknown-linux-musl binary
+FROM busybox:latest AS stage
+WORKDIR /stage
+COPY target/x86_64-unknown-linux-musl/release/minivectordb /stage/minivectordb
+RUN chmod 0755 /stage/minivectordb && mkdir -p /stage/data && chmod 1777 /stage/data
+
+FROM busybox:latest
+WORKDIR /app
+COPY --from=stage /stage/minivectordb /app/minivectordb
+COPY --from=stage /stage/data /data
+VOLUME ["/data"]
+ENTRYPOINT ["/app/minivectordb"]
+CMD ["--data-dir", "/data"]

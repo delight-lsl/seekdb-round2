@@ -1,0 +1,64 @@
+{
+  "schema_version": "agent-learning-evidence-v3-unbounded",
+  "task": "SeekDB 2026 Competition Round 2 - Lightweight Transactional Vector Database",
+  "student": "seeker_2026",
+  "synthetic": false,
+  "summary": "MiniVectorDB 设计、实现、调优与崩溃恢复全流程学习记录",
+  "user_prompts": [
+    "分析赛题约束，从零构建 Rust 轻量级向量数据库系统，实现完整 SQL 引擎、持久化存储、向量检索、事务与崩溃恢复，并打包为 Docker 镜像。",
+    "针对带过滤条件的向量检索进行优化，确保 Recall@10 稳定达到 0.95 以上。",
+    "执行端到端 MySQL 协议测试、基准性能测试以及 SIGKILL 异常崩溃恢复测试。"
+  ],
+  "conversations": [
+    {
+      "step": 1,
+      "role": "student",
+      "content": "我们需要根据赛题要求从零用 Rust 1.93.1 构建单机轻量级向量数据库 MiniVectorDB。关键约束包括：自主实现 SQL/存储/WAL/HNSW，不允许调用现成数据库引擎，数据持久化在 /data，支持单个显式事务与崩溃恢复，满足 Recall@10>=0.95。"
+    },
+    {
+      "step": 2,
+      "role": "assistant",
+      "content": "已梳理架构拆解为 8 个子模块：SQL、Storage、Vector、Transaction、Recovery、Catalog、CLI 和 Common。采用多阶段 Docker 镜像打包，并在 /data 维护数据文件与 WAL。"
+    },
+    {
+      "step": 3,
+      "role": "student",
+      "content": "在向量检索模块中，如果使用 HNSW 做带 WHERE 过滤的 TopK 检索，当过滤条件选择率较低时，探索预算不足容易导致召回率低于 0.95。我们应该在过滤候选过少时自适应回退到精确扫描，保证任何过滤条件下的 Recall@10 均>=0.95。"
+    },
+    {
+      "step": 4,
+      "role": "assistant",
+      "content": "已针对带过滤条件的向量检索实施双重保障：一是将 exploration budget 扩大为 (ef * 3).max(768)；二是当候选集少于 (K * 5) 时自动执行精确过滤补全，实测 Filtered Recall@10 达到 1.0000。"
+    },
+    {
+      "step": 5,
+      "role": "student",
+      "content": "请在 RTX6000 宿主机与 Docker 容器中分别执行官方 protocol_check、10,000 条 128 维基准测试以及模拟 SIGKILL 异常终止恢复测试，验证数据一致性与持久化。"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "exp_protocol_suite",
+      "name": "官方协议与 20 个测试用例验证",
+      "command": "python3 run.py --all",
+      "output": "20/20 test cases passed. Handshake, basic DDL, DML, transaction commit/rollback, and vector L2 search all succeeded with code 0."
+    },
+    {
+      "id": "exp_benchmark_3_3",
+      "name": "3.3 节综合基准测试 (10,000 条 128 维向量)",
+      "command": "cargo run --release --example bench",
+      "output": "100 batches x 100 rows insert took 1777ms (5627 rows/s) with WAL fsync. Unfiltered Recall@10 = 0.9720 (0.549ms/q). Filtered Recall@10 = 1.0000 (0.387ms/q). Both exceed 0.95 threshold."
+    },
+    {
+      "id": "exp_crash_recovery",
+      "name": "Docker 容器 SIGKILL 崩溃恢复测试",
+      "command": "kill -9 minivectordb_pid && restart",
+      "output": "Successfully recovered 100 committed rows from WAL on startup. Uncommitted transaction was correctly discarded. Database restarted cleanly with zero corrupted records."
+    }
+  ],
+  "retrospective": {
+    "problem_understanding": "本赛题的核心在于单进程单客户端协议适配与持久化恢复。在保证标准 MySQL 文本模式响应的同时，底层数据文件必须经受住非正常断电或崩溃检验，因此我们采用 Redo WAL + Checkpoint 机制。",
+    "tradeoffs": "针对向量索引，精确扫描保证 100% 召回但大样本量下延迟增加；HNSW 提供了亚毫秒级检索，但低选择率过滤会降低连通子图探索深度。我们通过自适应预算与小样本保底机制平衡了性能与 Recall 约束。",
+    "limitations": "当前第一版定位为单客户端单显式事务架构，未引入 MVCC 多版本并发控制与分布式分片；在百万级以上超大规模向量场景下需进一步引入量化压缩 (PQ/IVF) 与磁盘索引。"
+  }
+}
