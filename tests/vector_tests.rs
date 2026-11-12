@@ -250,3 +250,74 @@ fn test_hnsw_recall_and_filtered_ann() {
     assert_eq!(res.len(), 1);
     assert_eq!(res[0].2, 50);
 }
+
+#[test]
+fn test_commit_hnsw_rebuild_and_exact_f64_precision() {
+    let dir = TempDir::new("hnsw_commit_rebuild");
+    let mut db = Database::open(&dir.0).unwrap();
+
+    // 1. Verify exact mode preserves f64 precision on large coordinates even when HNSW index exists
+    db.execute_sql(
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, v VECTOR(2));",
+        SearchMode::Exact,
+    )
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO p VALUES (1, '[1000000.0, 100.0]'), (2, '[1000000.0, 0.0]');",
+        SearchMode::Exact,
+    )
+    .unwrap();
+    db.execute_sql("CREATE VECTOR INDEX idx_p ON p (v);", SearchMode::Exact)
+        .unwrap();
+    let ExecResult::Query { rows, .. } = db
+        .execute_sql(
+            "SELECT id FROM p ORDER BY L2_DISTANCE(v, '[0.0, 0.0]') LIMIT 2;",
+            SearchMode::Exact,
+        )
+        .unwrap()
+    else {
+        panic!("expected query");
+    };
+    assert_eq!(rows[0][0].as_i64().unwrap(), 2);
+    assert_eq!(rows[1][0].as_i64().unwrap(), 1);
+
+    // 2. Verify COMMIT with >50% deletes + new insert triggers HNSW rebuild AFTER DiskTable write
+    db.execute_sql(
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, v VECTOR(4));",
+        SearchMode::Exact,
+    )
+    .unwrap();
+    let mut batch = Vec::new();
+    for i in 1..=600 {
+        batch.push(format!("({}, '[{}.0, 0.0, 0.0, 0.0]')", i, i));
+    }
+    db.execute_sql(
+        &format!("INSERT INTO r VALUES {};", batch.join(",")),
+        SearchMode::Exact,
+    )
+    .unwrap();
+    db.execute_sql("CREATE VECTOR INDEX idx_r ON r (v);", SearchMode::Exact)
+        .unwrap();
+    db.execute_sql("BEGIN;", SearchMode::Exact).unwrap();
+    db.execute_sql("DELETE FROM r WHERE id <= 350;", SearchMode::Exact)
+        .unwrap();
+    db.execute_sql(
+        "INSERT INTO r VALUES (1000, '[350.5, 0.0, 0.0, 0.0]');",
+        SearchMode::Exact,
+    )
+    .unwrap();
+    db.execute_sql("COMMIT;", SearchMode::Exact).unwrap();
+
+    let ExecResult::Query { rows: ann_rows, .. } = db
+        .execute_sql(
+            "SELECT id FROM r ORDER BY L2_DISTANCE(v, '[350.5, 0.0, 0.0, 0.0]') LIMIT 3;",
+            SearchMode::Ann,
+        )
+        .unwrap()
+    else {
+        panic!("expected query");
+    };
+    assert_eq!(ann_rows[0][0].as_i64().unwrap(), 1000);
+    assert_eq!(ann_rows[1][0].as_i64().unwrap(), 351);
+    assert_eq!(ann_rows[2][0].as_i64().unwrap(), 352);
+}

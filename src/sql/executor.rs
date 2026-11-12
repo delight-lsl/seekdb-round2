@@ -18,7 +18,7 @@ use crate::storage::codec::{
 use crate::storage::engine::{pk_of_row, StorageEngine};
 use crate::transaction::manager::TransactionManager;
 use crate::transaction::operation::WalOp;
-use crate::vector::distance::{l2_distance, l2_distance_squared, l2_distance_squared_f32_fast};
+use crate::vector::distance::{l2_distance, l2_distance_squared};
 use crate::vector::index::HnswIndex;
 use crate::vector::search::{TopKCandidate, TopKHeap};
 use serde_json::Value as JsonValue;
@@ -290,6 +290,68 @@ impl Database {
         Ok(ExecResult::Ok)
     }
 
+    fn apply_table_write_and_indexes(
+        &mut self,
+        tid: TableId,
+        puts: Vec<(RowId, Option<i64>, Row)>,
+        deletes: &[(RowId, Option<i64>)],
+        wal_ops: &[WalOp],
+    ) -> Result<()> {
+        let indexes = self.storage.get_table(tid)?.schema.indexes.clone();
+        if indexes.is_empty() {
+            let dt = self.storage.get_table_mut(tid)?;
+            return dt.apply_batch_owned_with_wal(puts, deletes, wal_ops, false);
+        }
+        let pk_col_idx = self.storage.get_table(tid)?.schema.pk_col_idx;
+        let mut idx_puts: Vec<(usize, Vec<(RowId, Option<i64>, Option<Vec<f32>>)>)> =
+            Vec::with_capacity(indexes.len());
+        for idx_schema in &indexes {
+            let mut col_updates = Vec::with_capacity(puts.len());
+            for (rid, _, row) in &puts {
+                let pk = pk_col_idx.and_then(|i| match &row.values[i] {
+                    Value::BigInt(v) => Some(*v),
+                    _ => None,
+                });
+                let vec_opt = match &row.values[idx_schema.col_idx] {
+                    Value::Vector(v) => Some(v.clone()),
+                    _ => None,
+                };
+                col_updates.push((*rid, pk, vec_opt));
+            }
+            idx_puts.push((idx_schema.col_idx, col_updates));
+        }
+        {
+            let dt = self.storage.get_table_mut(tid)?;
+            dt.apply_batch_owned_with_wal(puts, deletes, wal_ops, false)?;
+        }
+        for (idx_schema, (_, col_updates)) in indexes.iter().zip(idx_puts.iter()) {
+            if let Some(hnsw) = self.hnsw_indexes.get_mut(&(tid, idx_schema.col_idx)) {
+                for &(rid, _) in deletes {
+                    hnsw.delete(rid);
+                }
+                for (rid, pk, vec_opt) in col_updates {
+                    if let Some(vec) = vec_opt {
+                        hnsw.upsert(*rid, *pk, vec)?;
+                    } else {
+                        hnsw.delete(*rid);
+                    }
+                }
+                if hnsw.needs_rebuild() {
+                    let dt = self.storage.get_table(tid)?;
+                    let rebuilt = build_hnsw_from_disk(
+                        &self.data_dir,
+                        dt,
+                        idx_schema.col_idx,
+                        idx_schema.dim,
+                        &idx_schema.name,
+                    )?;
+                    self.hnsw_indexes.insert((tid, idx_schema.col_idx), rebuilt);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn apply_index_updates_for_table(
         &mut self,
         tid: TableId,
@@ -354,11 +416,7 @@ impl Database {
                 .map(|(rid, (old_pk, row))| (rid, old_pk, row))
                 .collect();
             let deletes: Vec<(RowId, Option<i64>)> = tws.deletes.into_iter().collect();
-            self.apply_index_updates_for_table(tid, &puts, &deletes)?;
-            {
-                let dt = self.storage.get_table_mut(tid)?;
-                dt.apply_batch_owned_with_wal(puts, &deletes, &wal_ops, false)?;
-            }
+            self.apply_table_write_and_indexes(tid, puts, &deletes, &wal_ops)?;
         }
         for (tid, idx) in new_indexes {
             let dt = self.storage.get_table(tid)?;
@@ -492,11 +550,7 @@ impl Database {
         }
 
         self.wal.append_committed_txn(&wal_ops)?;
-        self.apply_index_updates_for_table(schema.table_id, &puts, &[])?;
-        {
-            let dt = self.storage.get_table_mut(schema.table_id)?;
-            dt.apply_batch_owned_with_wal(puts, &[], &wal_ops, false)?;
-        }
+        self.apply_table_write_and_indexes(schema.table_id, puts, &[], &wal_ops)?;
         if self.wal.should_checkpoint() {
             perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
         }
@@ -717,11 +771,7 @@ impl Database {
             });
         }
         self.wal.append_committed_txn(&wal_ops)?;
-        self.apply_index_updates_for_table(schema.table_id, &updates, &[])?;
-        {
-            let dt = self.storage.get_table_mut(schema.table_id)?;
-            dt.apply_batch_owned_with_wal(updates, &[], &wal_ops, false)?;
-        }
+        self.apply_table_write_and_indexes(schema.table_id, updates, &[], &wal_ops)?;
         if self.wal.should_checkpoint() {
             perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
         }
@@ -1098,6 +1148,13 @@ impl Database {
         bound_items: &[BoundSelectItem],
     ) -> Result<Option<Vec<Vec<JsonValue>>>> {
         let tid = schema.table_id;
+        let dt_ref = self.storage.tables.get(&tid);
+        if where_expr.is_some()
+            && dt_ref.is_some_and(|dt| dt.cache_covers_all() && dt.row_locations.len() <= 20_000)
+        {
+            return Ok(None);
+        }
+
         let tws_opt = self
             .txn_mgr
             .active
@@ -1113,7 +1170,6 @@ impl Database {
             }
         }
 
-        let dt_ref = self.storage.tables.get(&tid);
         let hnsw = self.hnsw_indexes.get_mut(&(tid, col_idx)).unwrap();
 
         let (cands, exhaustive) = if let Some(w_expr) = where_expr {
@@ -1248,12 +1304,6 @@ impl Database {
             .as_ref()
             .and_then(|t| t.table_writes.get(&tid));
 
-        let use_fast_f32 = query.iter().all(|&x| x.abs() < 1e15)
-            && self
-                .hnsw_indexes
-                .get(&(tid, col_idx))
-                .is_some_and(|h| h.is_safe_for_f32_dist());
-
         let mut heap = TopKHeap::new(k);
 
         if let Some(dt) = self.storage.tables.get(&tid) {
@@ -1289,44 +1339,93 @@ impl Database {
                 }
                 let mut light_heap: std::collections::BinaryHeap<LightCand> =
                     std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
-                for (rid, row) in dt.cache.iter() {
-                    if let Some(tws) = tws_opt {
-                        if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
-                            continue;
-                        }
+                let mut cutoff = f64::INFINITY;
+                let mut scanned_via_flat_hnsw = false;
+
+                if where_expr.is_none() && tws_opt.is_none() {
+                    if let Some(hnsw) = self.hnsw_indexes.get(&(tid, col_idx)) {
+                        scanned_via_flat_hnsw = hnsw.scan_in_mem_live(|rid, pk, v| {
+                            let dist_sq = l2_distance_squared(v, query)?;
+                            if light_heap.len() < k {
+                                light_heap.push(LightCand {
+                                    dist_sq,
+                                    pk,
+                                    row_id: rid,
+                                });
+                                if light_heap.len() == k {
+                                    cutoff = light_heap.peek().unwrap().dist_sq;
+                                }
+                            } else if dist_sq <= cutoff {
+                                let cand = LightCand {
+                                    dist_sq,
+                                    pk,
+                                    row_id: rid,
+                                };
+                                let mut replaced = false;
+                                if let Some(mut worst) = light_heap.peek_mut() {
+                                    if cand < *worst {
+                                        *worst = cand;
+                                        replaced = true;
+                                    }
+                                }
+                                if replaced {
+                                    cutoff = light_heap.peek().unwrap().dist_sq;
+                                }
+                            }
+                            Ok(())
+                        })?;
                     }
-                    if let Some(w_expr) = where_expr {
-                        if !eval_where(w_expr, row)? {
-                            continue;
-                        }
-                    }
-                    let dist_sq = match &row.values[col_idx] {
-                        Value::Vector(v) => {
-                            if use_fast_f32 {
-                                l2_distance_squared_f32_fast(v, query) as f64
-                            } else {
-                                l2_distance_squared(v, query)?
+                }
+
+                if !scanned_via_flat_hnsw {
+                    for (rid, row) in dt.cache.iter() {
+                        if let Some(tws) = tws_opt {
+                            if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
+                                continue;
                             }
                         }
-                        Value::Null => continue,
-                        _ => {
-                            return Err(DbError::new(
-                                ErrorCode::TypeMismatch,
-                                "expected VECTOR column",
-                            ));
+                        if let Some(w_expr) = where_expr {
+                            if !eval_where(w_expr, row)? {
+                                continue;
+                            }
                         }
-                    };
-                    let pk = pk_of_row(schema, row);
-                    let cand = LightCand {
-                        dist_sq,
-                        pk,
-                        row_id: rid,
-                    };
-                    if light_heap.len() < k {
-                        light_heap.push(cand);
-                    } else if let Some(mut worst) = light_heap.peek_mut() {
-                        if cand < *worst {
-                            *worst = cand;
+                        let dist_sq = match &row.values[col_idx] {
+                            Value::Vector(v) => l2_distance_squared(v, query)?,
+                            Value::Null => continue,
+                            _ => {
+                                return Err(DbError::new(
+                                    ErrorCode::TypeMismatch,
+                                    "expected VECTOR column",
+                                ));
+                            }
+                        };
+                        if light_heap.len() < k {
+                            let pk = pk_of_row(schema, row);
+                            light_heap.push(LightCand {
+                                dist_sq,
+                                pk,
+                                row_id: rid,
+                            });
+                            if light_heap.len() == k {
+                                cutoff = light_heap.peek().unwrap().dist_sq;
+                            }
+                        } else if dist_sq <= cutoff {
+                            let pk = pk_of_row(schema, row);
+                            let cand = LightCand {
+                                dist_sq,
+                                pk,
+                                row_id: rid,
+                            };
+                            let mut replaced = false;
+                            if let Some(mut worst) = light_heap.peek_mut() {
+                                if cand < *worst {
+                                    *worst = cand;
+                                    replaced = true;
+                                }
+                            }
+                            if replaced {
+                                cutoff = light_heap.peek().unwrap().dist_sq;
+                            }
                         }
                     }
                 }
@@ -1846,7 +1945,26 @@ fn infer_expr_type(schema: &TableSchema, expr: &BoundExpr) -> Result<ExprType> {
     }
 }
 
+#[inline]
 pub fn eval_where(expr: &BoundExpr, row: &Row) -> Result<bool> {
+    if let BoundExpr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    } = expr
+    {
+        match (left.as_ref(), right.as_ref()) {
+            (BoundExpr::Column(cidx), BoundExpr::Literal(lit))
+            | (BoundExpr::Literal(lit), BoundExpr::Column(cidx)) => {
+                return Ok(match (&row.values[*cidx], lit) {
+                    (Value::BigInt(a), Value::BigInt(b)) => a == b,
+                    (Value::Varchar(a), Value::Varchar(b)) => a == b,
+                    _ => false,
+                });
+            }
+            _ => {}
+        }
+    }
     match eval_tri_bool(expr, row)? {
         Some(b) => Ok(b),
         None => Ok(false),

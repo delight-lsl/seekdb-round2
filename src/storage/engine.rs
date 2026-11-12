@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 /// Bounded FIFO/clock row cache capping heap RAM at `max_bytes`.
 #[derive(Debug)]
 pub struct BoundedRowCache {
-    entries: HashMap<RowId, (Row, usize, u64)>,
-    order: VecDeque<(RowId, u64)>,
+    entries: HashMap<RowId, (Row, u32, u32)>,
+    order: VecDeque<(RowId, u32)>,
     current_bytes: usize,
     max_bytes: usize,
-    next_gen: u64,
+    next_gen: u32,
 }
 
 impl BoundedRowCache {
@@ -61,10 +61,15 @@ impl BoundedRowCache {
         if est > self.max_bytes / 4 {
             return;
         }
-        if let Some((_, old_sz, _)) = self.entries.remove(&row_id) {
-            self.current_bytes = self.current_bytes.saturating_sub(old_sz);
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let gen = self.next_gen;
+        let est_u32 = est.min(u32::MAX as usize) as u32;
+        if let Some((_, old_sz, _)) = self.entries.insert(row_id, (row, est_u32, gen)) {
+            self.current_bytes = self.current_bytes.saturating_sub(old_sz as usize);
         }
-        while self.current_bytes + est > self.max_bytes {
+        self.current_bytes += est;
+        self.order.push_back((row_id, gen));
+        while self.current_bytes > self.max_bytes {
             let Some((evict_id, evict_gen)) = self.order.pop_front() else {
                 break;
             };
@@ -74,20 +79,15 @@ impl BoundedRowCache {
                 .is_some_and(|&(_, _, g)| g == evict_gen)
             {
                 if let Some((_, sz, _)) = self.entries.remove(&evict_id) {
-                    self.current_bytes = self.current_bytes.saturating_sub(sz);
+                    self.current_bytes = self.current_bytes.saturating_sub(sz as usize);
                 }
             }
         }
-        self.next_gen = self.next_gen.wrapping_add(1);
-        let gen = self.next_gen;
-        self.current_bytes += est;
-        self.entries.insert(row_id, (row, est, gen));
-        self.order.push_back((row_id, gen));
     }
 
     pub fn invalidate(&mut self, row_id: RowId) {
         if let Some((_, sz, _)) = self.entries.remove(&row_id) {
-            self.current_bytes = self.current_bytes.saturating_sub(sz);
+            self.current_bytes = self.current_bytes.saturating_sub(sz as usize);
         }
     }
 
@@ -157,6 +157,8 @@ impl DiskTable {
         let mut old_pks: HashMap<RowId, i64> = HashMap::new();
 
         let scan_len = file.len();
+        let cache_in_single_pass = scan_len <= 32 * 1024 * 1024;
+        let mut cache = BoundedRowCache::new(64 * 1024 * 1024);
         file.scan_frames(scan_len, |frame| {
             total_frames += 1;
             max_row_id = max_row_id.max(frame.row_id);
@@ -165,7 +167,14 @@ impl DiskTable {
                     if let Some(old_pk) = old_pks.remove(&frame.row_id) {
                         pk_index.remove(&old_pk);
                     }
-                    if let Some(pk_idx) = schema.pk_col_idx {
+                    if cache_in_single_pass {
+                        let row = decode_row(&frame.payload, &schema)?;
+                        if let Some(pk) = pk_of_row(&schema, &row) {
+                            pk_index.insert(pk, frame.row_id);
+                            old_pks.insert(frame.row_id, pk);
+                        }
+                        cache.insert(frame.row_id, row);
+                    } else if let Some(pk_idx) = schema.pk_col_idx {
                         if let Some(pk) = extract_pk_from_row_bytes(&frame.payload, pk_idx)? {
                             pk_index.insert(pk, frame.row_id);
                             old_pks.insert(frame.row_id, pk);
@@ -178,25 +187,13 @@ impl DiskTable {
                     if let Some(old_pk) = old_pks.remove(&frame.row_id) {
                         pk_index.remove(&old_pk);
                     }
+                    if cache_in_single_pass {
+                        cache.invalidate(frame.row_id);
+                    }
                 }
             }
             Ok(true)
         })?;
-
-        let mut cache = BoundedRowCache::new(64 * 1024 * 1024);
-        if scan_len <= 32 * 1024 * 1024 && !row_locations.is_empty() {
-            file.scan_frames(scan_len, |frame| {
-                if frame.op == DataRecordOp::Put
-                    && row_locations.get(&frame.row_id)
-                        == Some(&(frame.frame_offset, frame.frame_len))
-                {
-                    if let Ok(row) = decode_row(&frame.payload, &schema) {
-                        cache.insert(frame.row_id, row);
-                    }
-                }
-                Ok(true)
-            })?;
-        }
 
         Ok(Self {
             schema,

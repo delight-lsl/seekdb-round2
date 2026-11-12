@@ -36,7 +36,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
-        let mut tokens = Vec::new();
+        let mut tokens = Vec::with_capacity(self.input.len() / 8 + 8);
         loop {
             let tok = self.next_token()?;
             let is_eof = tok == Token::Eof;
@@ -48,14 +48,26 @@ impl<'a> Lexer<'a> {
         Ok(tokens)
     }
 
+    #[inline]
     fn peek_char(&self) -> Option<char> {
-        self.input[self.pos..].chars().next()
+        let bytes = self.input.as_bytes();
+        if self.pos >= bytes.len() {
+            return None;
+        }
+        let b = bytes[self.pos];
+        if b.is_ascii() {
+            Some(b as char)
+        } else {
+            self.input[self.pos..].chars().next()
+        }
     }
 
+    #[inline]
     fn rest(&self) -> &'a str {
         &self.input[self.pos..]
     }
 
+    #[inline]
     fn advance_char(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
         self.pos += ch.len_utf8();
@@ -63,19 +75,23 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {
+        let bytes = self.input.as_bytes();
         loop {
+            while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
             while let Some(ch) = self.peek_char() {
-                if ch.is_whitespace() {
+                if !ch.is_ascii() && ch.is_whitespace() {
                     self.advance_char();
                 } else {
                     break;
                 }
             }
             if self.rest().starts_with("--") {
-                while let Some(ch) = self.advance_char() {
-                    if ch == '\n' {
-                        break;
-                    }
+                if let Some(nl_rel) = self.rest().find('\n') {
+                    self.pos += nl_rel + 1;
+                } else {
+                    self.pos = self.input.len();
                 }
                 continue;
             }
@@ -194,7 +210,23 @@ impl<'a> Lexer<'a> {
 
     fn read_string_literal(&mut self) -> Result<Token> {
         self.advance_char(); // opening quote
-        let mut out = String::new();
+        let start = self.pos;
+        let rest = &self.input[start..];
+        let Some(first_quote) = rest.find('\'') else {
+            return Err(DbError::new(
+                ErrorCode::SyntaxError,
+                "unterminated string literal",
+            ));
+        };
+        let after_quote = start + first_quote + 1;
+        if self.input.as_bytes().get(after_quote) != Some(&b'\'') {
+            self.pos = after_quote;
+            return Ok(Token::StringLit(rest[..first_quote].to_string()));
+        }
+        let mut out = String::with_capacity(first_quote + 16);
+        out.push_str(&rest[..first_quote]);
+        out.push('\'');
+        self.pos = after_quote + 1;
         loop {
             let Some(ch) = self.advance_char() else {
                 return Err(DbError::new(

@@ -418,8 +418,8 @@ impl HnswIndex {
             dim,
             m,
             m0: m * 2,
-            ef_construction: 120,
-            ef_search: 128,
+            ef_construction: 160,
+            ef_search: 256,
             m_l: 1.0 / (m as f64).ln(),
             nodes: Vec::new(),
             row_to_node: HashMap::new(),
@@ -452,6 +452,26 @@ impl HnswIndex {
 
     pub fn needs_table_vectors(&self) -> bool {
         self.needs_table_vectors
+    }
+
+    /// Scan all live nodes directly from the flat in-memory vector buffer (`!spilled && !needs_table_vectors`).
+    pub fn scan_in_mem_live<F>(&self, mut f: F) -> Result<bool>
+    where
+        F: FnMut(RowId, Option<i64>, &[f32]) -> Result<()>,
+    {
+        if self.vectors.spilled || self.needs_table_vectors {
+            return Ok(false);
+        }
+        let dim = self.dim;
+        let in_mem = &self.vectors.in_mem;
+        for (nid, node) in self.nodes.iter().enumerate() {
+            if node.deleted {
+                continue;
+            }
+            let start = nid * dim;
+            f(node.row_id, node.pk, &in_mem[start..start + dim])?;
+        }
+        Ok(true)
     }
 
     pub fn live_count(&self) -> usize {
@@ -826,16 +846,21 @@ impl HnswIndex {
                     vectors.prefetch_node(nbs[i + 1].id);
                 }
                 let d = vectors.dist_to_query(nb_id, query, query_safe)?;
-                let worst_now = results.peek().map_or(f64::INFINITY, |x| x.dist);
-                if results.len() < ef || d < worst_now {
+                if results.len() < ef {
                     let item = DistNode {
                         dist: d,
                         node_id: nb_id,
                     };
                     candidates.push(Reverse(item));
                     results.push(item);
-                    if results.len() > ef {
-                        results.pop();
+                } else if let Some(mut worst) = results.peek_mut() {
+                    if d < worst.dist {
+                        let item = DistNode {
+                            dist: d,
+                            node_id: nb_id,
+                        };
+                        *worst = item;
+                        candidates.push(Reverse(item));
                     }
                 }
             }
@@ -921,14 +946,9 @@ impl HnswIndex {
         let ef = if is_filtered {
             self.ef_search.max(k.saturating_mul(16))
         } else if self.dim >= 64 && self.nodes.len() >= 4096 {
-            self.ef_search.max(380).max(k.saturating_mul(4))
+            self.ef_search.max(272).max(k.saturating_mul(4))
         } else {
             self.ef_search.max(k.saturating_mul(4))
-        };
-        let visit_budget = if is_filtered {
-            (ef * 24).max(6144)
-        } else {
-            usize::MAX
         };
 
         let vgen = self.next_visit_gen();
@@ -940,6 +960,82 @@ impl HnswIndex {
 
         let mut candidates: BinaryHeap<Reverse<DistNode>> = BinaryHeap::with_capacity(ef * 2);
         let mut results: BinaryHeap<DistNode> = BinaryHeap::with_capacity(ef + 1);
+
+        if !is_filtered && tx_excluded.is_empty() {
+            candidates.push(Reverse(DistNode {
+                dist: cur_dist,
+                node_id: cur_ep,
+            }));
+            if !nodes[cur_ep as usize].deleted {
+                results.push(DistNode {
+                    dist: cur_dist,
+                    node_id: cur_ep,
+                });
+            }
+            while let Some(Reverse(cur)) = candidates.pop() {
+                if results.len() >= ef {
+                    if let Some(worst) = results.peek() {
+                        if cur.dist > worst.dist {
+                            break;
+                        }
+                    }
+                }
+                let nbs = &nodes[cur.node_id as usize].neighbors[0];
+                for (i, nb) in nbs.iter().enumerate() {
+                    let nb_id = nb.id;
+                    if visited[nb_id as usize] == vgen {
+                        continue;
+                    }
+                    visited[nb_id as usize] = vgen;
+                    if i + 1 < nbs.len() {
+                        vectors.prefetch_node(nbs[i + 1].id);
+                    }
+                    let d = vectors.dist_to_query(nb_id, query, query_safe)?;
+                    if results.len() < ef {
+                        let item = DistNode {
+                            dist: d,
+                            node_id: nb_id,
+                        };
+                        candidates.push(Reverse(item));
+                        if !nodes[nb_id as usize].deleted {
+                            results.push(item);
+                        }
+                    } else if let Some(mut worst) = results.peek_mut() {
+                        if d < worst.dist {
+                            let item = DistNode {
+                                dist: d,
+                                node_id: nb_id,
+                            };
+                            candidates.push(Reverse(item));
+                            if !nodes[nb_id as usize].deleted {
+                                *worst = item;
+                            }
+                        }
+                    }
+                }
+            }
+            let mut out: Vec<(f64, Option<i64>, RowId)> = results
+                .into_iter()
+                .map(|dn| {
+                    let node = &self.nodes[dn.node_id as usize];
+                    (dn.dist, node.pk, node.row_id)
+                })
+                .collect();
+            out.sort_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            let exhaustive = out.len() >= k || out.len() >= self.live_count;
+            out.truncate(k);
+            return Ok((out, exhaustive));
+        }
+
+        let visit_budget = if is_filtered {
+            (ef * 24).max(6144)
+        } else {
+            usize::MAX
+        };
         let mut explore_pool: BinaryHeap<DistNode> = BinaryHeap::with_capacity(ef * 2 + 1);
 
         candidates.push(Reverse(DistNode {
