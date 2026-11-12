@@ -62,10 +62,11 @@ catalog::manager   vector::search   transaction::manager
    - `distance.rs`：L2 欧氏距离与平方 L2 距离计算。向量以 `f32` 存储，使用 `f64` 累加差值平方以防止中间平方溢出，结合 8 路循环展开（及 x86_64 AVX2/FMA 运行时加速）。TopK 比较使用平方 L2 距离，仅在输出投影列时执行一次 `sqrt()`。
    - `search.rs`：基于 `BinaryHeap` 的精确 TopK 检索，复杂度 `O(N log K)`，支持先过滤后距离计算及按主键升序打破并列。
    - `index.rs`：自主实现的 HNSW 近似索引：
-     - 参数：`M = 16`, `M0 = 32`, `ef_construction = 200`, `ef_search = 128`。
+     - 参数：`M = 16`, `M0 = 32`, `ef_construction = 120`, `ef_search = 128`（高维场景自适应扩展搜索 `ef`）。
+     - 增量反向边启发式裁剪：在 `Neighbor` 中缓存邻居平方距离与 Tier-1/Tier-2 多样性标记，插入反向边时增量校验遮挡关系，避免全量重算两两距离。
      - 有界向量缓存（Bounded LRU Vector Cache，上限 512 MiB）：向量总大小不超过 512 MiB 时全量常驻连续扁平数组以获最高检索吞吐；超过 512 MiB 时自动淘汰并通过 `pread` 按需读取，避免触发 2 GiB 容器 OOM。
      - 过滤 ANN 检索：遍历图邻居保持连通性（仅将满足 `WHERE` 谓词且未删除的节点加入结果候选），若低选择率导致图检索命中不足 `K` 条，自动回退至带谓词过滤的精确扫描。
-     - 支持持久化快照到 `tables/idx_<tid>_<col>_g<gen>.hnsw` 与重启增量恢复。
+     - 流式紧凑快照：支持通过 `CrcWriter` 流式持久化快照到 `tables/idx_<tid>_<col>_g<gen>.hnsw`（表级索引采用 `storage_mode = 2` 外部表向量模式 + `u16` 紧凑邻居编码，消除与 `.dat` 的向量重复落盘）与重启恢复。
 
 7. **`transaction/` & `recovery/`**
    - `operation.rs` & `manager.rs`：维护单事务 `WriteSet`（按语句设置 Savepoint：单条语句中途失败可立即截断回滚该语句全部变更，保留同一事务内此前成功语句）。

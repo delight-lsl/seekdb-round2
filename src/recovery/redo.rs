@@ -151,10 +151,13 @@ pub fn recover_database(
                     hnsw_snap_path(data_dir, tid, idx_schema.col_idx, dt.generation);
                 let spill_path =
                     hnsw_spill_path(data_dir, tid, idx_schema.col_idx, dt.generation);
-                if let Some(loaded) =
+                if let Some(mut loaded) =
                     HnswIndex::load_snapshot(idx_schema.name.clone(), &snap_path, spill_path)?
                 {
                     if loaded.live_count() == dt.live_count() && loaded.dim == idx_schema.dim {
+                        if loaded.needs_table_vectors() {
+                            loaded.populate_vectors_from_table(dt, idx_schema.col_idx)?;
+                        }
                         hnsw_indexes.insert((tid, idx_schema.col_idx), loaded);
                         continue;
                     }

@@ -162,16 +162,18 @@ impl TableDataFile {
             },
         );
         let mut offset = 0_u64;
+        let mut stopped_early = false;
         while offset < limit_offset {
             let Some(frame) = read_next_data_frame(&mut reader, offset)? else {
                 break;
             };
             offset += frame.frame_len as u64;
             if !on_frame(frame)? {
+                stopped_early = true;
                 break;
             }
         }
-        if offset != limit_offset {
+        if !stopped_early && offset != limit_offset {
             return Err(DbError::new(
                 ErrorCode::IoError,
                 format!(

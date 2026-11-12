@@ -18,7 +18,7 @@ use crate::storage::codec::{
 use crate::storage::engine::{pk_of_row, StorageEngine};
 use crate::transaction::manager::TransactionManager;
 use crate::transaction::operation::WalOp;
-use crate::vector::distance::{l2_distance, l2_distance_squared};
+use crate::vector::distance::{l2_distance, l2_distance_squared, l2_distance_squared_f32_fast};
 use crate::vector::index::HnswIndex;
 use crate::vector::search::{TopKCandidate, TopKHeap};
 use serde_json::Value as JsonValue;
@@ -163,6 +163,25 @@ impl Database {
 
     pub fn shutdown(&mut self) -> Result<()> {
         self.txn_mgr.discard_if_active();
+        let any_hnsw_dirty = self.hnsw_indexes.values().any(|idx| idx.is_dirty());
+        let any_table_needs_compact = self.storage.tables.values().any(|dt| dt.needs_compaction());
+        let has_ckp = self.data_dir.join("checkpoint.meta").exists();
+        if !self.wal.dirty_since_checkpoint
+            && !any_hnsw_dirty
+            && !any_table_needs_compact
+            && has_ckp
+        {
+            return Ok(());
+        }
+        for dt in self.storage.tables.values_mut() {
+            dt.cache.clear();
+            dt.cache.shrink_to_fit();
+        }
+        if !any_table_needs_compact {
+            for hnsw in self.hnsw_indexes.values_mut() {
+                hnsw.release_inmem_vectors_for_shutdown();
+            }
+        }
         perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
         Ok(())
     }
@@ -335,11 +354,11 @@ impl Database {
                 .map(|(rid, (old_pk, row))| (rid, old_pk, row))
                 .collect();
             let deletes: Vec<(RowId, Option<i64>)> = tws.deletes.into_iter().collect();
+            self.apply_index_updates_for_table(tid, &puts, &deletes)?;
             {
                 let dt = self.storage.get_table_mut(tid)?;
-                dt.apply_batch(&puts, &deletes, false)?;
+                dt.apply_batch_owned_with_wal(puts, &deletes, &wal_ops, false)?;
             }
-            self.apply_index_updates_for_table(tid, &puts, &deletes)?;
         }
         for (tid, idx) in new_indexes {
             let dt = self.storage.get_table(tid)?;
@@ -473,11 +492,11 @@ impl Database {
         }
 
         self.wal.append_committed_txn(&wal_ops)?;
+        self.apply_index_updates_for_table(schema.table_id, &puts, &[])?;
         {
             let dt = self.storage.get_table_mut(schema.table_id)?;
-            dt.apply_batch(&puts, &[], false)?;
+            dt.apply_batch_owned_with_wal(puts, &[], &wal_ops, false)?;
         }
-        self.apply_index_updates_for_table(schema.table_id, &puts, &[])?;
         if self.wal.should_checkpoint() {
             perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
         }
@@ -698,11 +717,11 @@ impl Database {
             });
         }
         self.wal.append_committed_txn(&wal_ops)?;
+        self.apply_index_updates_for_table(schema.table_id, &updates, &[])?;
         {
             let dt = self.storage.get_table_mut(schema.table_id)?;
-            dt.apply_batch(&updates, &[], false)?;
+            dt.apply_batch_owned_with_wal(updates, &[], &wal_ops, false)?;
         }
-        self.apply_index_updates_for_table(schema.table_id, &updates, &[])?;
         if self.wal.should_checkpoint() {
             perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
         }
@@ -1123,6 +1142,28 @@ impl Database {
             return Ok(None);
         }
 
+        if tws_opt.is_none() {
+            if let Some(dt) = dt_ref {
+                let mut out_rows = Vec::with_capacity(cands.len());
+                for (_, _, rid) in cands {
+                    if let Some(cached) = dt.cache.get(rid) {
+                        out_rows.push(project_row(bound_items, cached)?);
+                    } else {
+                        let &(off, flen) = dt.row_locations.get(&rid).ok_or_else(|| {
+                            DbError::new(
+                                ErrorCode::InternalError,
+                                "HNSW row_id missing in DiskTable",
+                            )
+                        })?;
+                        let frame = dt.file.read_frame_at(off, flen)?;
+                        let row = decode_row_selective(&frame.payload, schema, needed_cols)?;
+                        out_rows.push(project_row(bound_items, &row)?);
+                    }
+                }
+                return Ok(Some(out_rows));
+            }
+        }
+
         let mut heap = TopKHeap::new(k);
         if let Some(dt) = dt_ref {
             for (dist_sq, pk, rid) in cands {
@@ -1207,6 +1248,12 @@ impl Database {
             .as_ref()
             .and_then(|t| t.table_writes.get(&tid));
 
+        let use_fast_f32 = query.iter().all(|&x| x.abs() < 1e15)
+            && self
+                .hnsw_indexes
+                .get(&(tid, col_idx))
+                .is_some_and(|h| h.is_safe_for_f32_dist());
+
         let mut heap = TopKHeap::new(k);
 
         if let Some(dt) = self.storage.tables.get(&tid) {
@@ -1254,7 +1301,13 @@ impl Database {
                         }
                     }
                     let dist_sq = match &row.values[col_idx] {
-                        Value::Vector(v) => l2_distance_squared(v, query)?,
+                        Value::Vector(v) => {
+                            if use_fast_f32 {
+                                l2_distance_squared_f32_fast(v, query) as f64
+                            } else {
+                                l2_distance_squared(v, query)?
+                            }
+                        }
                         Value::Null => continue,
                         _ => {
                             return Err(DbError::new(
@@ -1276,6 +1329,16 @@ impl Database {
                             *worst = cand;
                         }
                     }
+                }
+                if tws_opt.is_none() {
+                    let sorted = light_heap.into_sorted_vec();
+                    let mut out_rows = Vec::with_capacity(sorted.len());
+                    for cand in sorted {
+                        if let Some(row) = dt.cache.get(cand.row_id) {
+                            out_rows.push(project_row(bound_items, row)?);
+                        }
+                    }
+                    return Ok(out_rows);
                 }
                 for cand in light_heap {
                     if let Some(row) = dt.cache.get(cand.row_id) {

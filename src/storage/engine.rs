@@ -8,6 +8,7 @@ use crate::storage::codec::{
 };
 use crate::storage::file::{atomic_write_file, sync_dir, TableDataFile};
 use crate::storage::record::{encode_data_frame, DataRecordOp};
+use crate::transaction::operation::WalOp;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
@@ -16,10 +17,11 @@ use std::path::{Path, PathBuf};
 /// Bounded FIFO/clock row cache capping heap RAM at `max_bytes`.
 #[derive(Debug)]
 pub struct BoundedRowCache {
-    entries: HashMap<RowId, (Row, usize)>,
-    order: VecDeque<RowId>,
+    entries: HashMap<RowId, (Row, usize, u64)>,
+    order: VecDeque<(RowId, u64)>,
     current_bytes: usize,
     max_bytes: usize,
+    next_gen: u64,
 }
 
 impl BoundedRowCache {
@@ -29,6 +31,7 @@ impl BoundedRowCache {
             order: VecDeque::new(),
             current_bytes: 0,
             max_bytes,
+            next_gen: 0,
         }
     }
 
@@ -41,11 +44,16 @@ impl BoundedRowCache {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (RowId, &Row)> {
-        self.entries.iter().map(|(&rid, (row, _))| (rid, row))
+        self.entries.iter().map(|(&rid, (row, _, _))| (rid, row))
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = RowId> + '_ {
+        self.entries.keys().copied()
+    }
+
+    #[inline]
     pub fn get(&self, row_id: RowId) -> Option<&Row> {
-        self.entries.get(&row_id).map(|(r, _)| r)
+        self.entries.get(&row_id).map(|(r, _, _)| r)
     }
 
     pub fn insert(&mut self, row_id: RowId, row: Row) {
@@ -53,24 +61,32 @@ impl BoundedRowCache {
         if est > self.max_bytes / 4 {
             return;
         }
-        if let Some((_, old_sz)) = self.entries.remove(&row_id) {
+        if let Some((_, old_sz, _)) = self.entries.remove(&row_id) {
             self.current_bytes = self.current_bytes.saturating_sub(old_sz);
         }
         while self.current_bytes + est > self.max_bytes {
-            let Some(evict_id) = self.order.pop_front() else {
+            let Some((evict_id, evict_gen)) = self.order.pop_front() else {
                 break;
             };
-            if let Some((_, sz)) = self.entries.remove(&evict_id) {
-                self.current_bytes = self.current_bytes.saturating_sub(sz);
+            if self
+                .entries
+                .get(&evict_id)
+                .is_some_and(|&(_, _, g)| g == evict_gen)
+            {
+                if let Some((_, sz, _)) = self.entries.remove(&evict_id) {
+                    self.current_bytes = self.current_bytes.saturating_sub(sz);
+                }
             }
         }
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let gen = self.next_gen;
         self.current_bytes += est;
-        self.entries.insert(row_id, (row, est));
-        self.order.push_back(row_id);
+        self.entries.insert(row_id, (row, est, gen));
+        self.order.push_back((row_id, gen));
     }
 
     pub fn invalidate(&mut self, row_id: RowId) {
-        if let Some((_, sz)) = self.entries.remove(&row_id) {
+        if let Some((_, sz, _)) = self.entries.remove(&row_id) {
             self.current_bytes = self.current_bytes.saturating_sub(sz);
         }
     }
@@ -79,6 +95,11 @@ impl BoundedRowCache {
         self.entries.clear();
         self.order.clear();
         self.current_bytes = 0;
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+        self.order.shrink_to_fit();
     }
 }
 
@@ -314,6 +335,80 @@ impl DiskTable {
                 self.pk_index.insert(pk, rid);
             }
             self.cache.insert(rid, row.clone());
+        }
+        Ok(())
+    }
+
+    /// Append a batch reusing pre-encoded `WalOp::PutRow` bytes and moving `Row` into cache without re-encoding or cloning.
+    pub fn apply_batch_owned_with_wal(
+        &mut self,
+        puts: Vec<(RowId, Option<i64>, Row)>,
+        deletes: &[(RowId, Option<i64>)],
+        wal_ops: &[WalOp],
+        sync_file: bool,
+    ) -> Result<()> {
+        if puts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let mut batch_buf = Vec::with_capacity(puts.len() * 64 + deletes.len() * 24);
+        let mut new_locs = Vec::with_capacity(puts.len());
+        let base_offset = self.file.len();
+
+        let mut wal_put_iter = wal_ops.iter().filter_map(|op| match op {
+            WalOp::PutRow {
+                table_id,
+                row_id,
+                row_bytes,
+                ..
+            } if *table_id == self.schema.table_id => Some((*row_id, row_bytes.as_slice())),
+            _ => None,
+        });
+
+        let mut fallback_buf = Vec::new();
+        for (rid, old_pk, row) in puts {
+            let payload_slice = match wal_put_iter.next() {
+                Some((wrid, bytes)) if wrid == rid => bytes,
+                _ => {
+                    fallback_buf.clear();
+                    encode_row(&row, &mut fallback_buf)?;
+                    fallback_buf.as_slice()
+                }
+            };
+            let frame_off = base_offset + batch_buf.len() as u64;
+            let frame_len =
+                encode_data_frame(DataRecordOp::Put, rid, payload_slice, &mut batch_buf)?;
+            new_locs.push((rid, old_pk, frame_off, frame_len, row));
+        }
+        for (rid, _) in deletes {
+            encode_data_frame(DataRecordOp::Tombstone, *rid, &[], &mut batch_buf)?;
+        }
+
+        self.file.append_bytes(&batch_buf)?;
+        if sync_file {
+            self.file.sync()?;
+        }
+
+        for (_, old_pk, _, _, _) in &new_locs {
+            if let Some(opk) = old_pk {
+                self.pk_index.remove(opk);
+            }
+        }
+        for (rid, old_pk) in deletes {
+            if let Some(opk) = old_pk {
+                self.pk_index.remove(opk);
+            }
+            self.row_locations.remove(rid);
+            self.total_frames += 1;
+            self.cache.invalidate(*rid);
+        }
+        for (rid, _, off, len, row) in new_locs {
+            self.row_locations.insert(rid, (off, len));
+            self.total_frames += 1;
+            self.next_row_id = self.next_row_id.max(rid + 1);
+            if let Some(pk) = pk_of_row(&self.schema, &row) {
+                self.pk_index.insert(pk, rid);
+            }
+            self.cache.insert(rid, row);
         }
         Ok(())
     }

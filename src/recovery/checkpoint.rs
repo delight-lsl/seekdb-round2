@@ -29,6 +29,20 @@ pub fn build_hnsw_from_disk(
 ) -> Result<HnswIndex> {
     let spill_path = hnsw_spill_path(data_dir, dt.schema.table_id, col_idx, dt.generation);
     let mut hnsw = HnswIndex::new(index_name.to_string(), dim, spill_path);
+    hnsw.reserve(dt.live_count());
+    if dt.cache_covers_all() {
+        let mut rids: Vec<crate::common::types::RowId> = dt.cache.keys().collect();
+        rids.sort_unstable();
+        for rid in rids {
+            if let Some(row) = dt.cache.get(rid) {
+                let pk = pk_of_row(&dt.schema, row);
+                if let Value::Vector(ref vec) = row.values[col_idx] {
+                    hnsw.upsert(rid, pk, vec)?;
+                }
+            }
+        }
+        return Ok(hnsw);
+    }
     let mut needed = vec![false; dt.schema.columns.len()];
     needed[col_idx] = true;
     if let Some(pk_idx) = dt.schema.pk_col_idx {
@@ -93,10 +107,13 @@ pub fn perform_checkpoint(
     for ((tid, col_idx), hnsw) in hnsw_indexes.iter_mut() {
         if let Ok(dt) = storage.get_table(*tid) {
             let snap = hnsw_snap_path(&data_dir, *tid, *col_idx, dt.generation);
+            if !hnsw.is_dirty() && snap.exists() {
+                continue;
+            }
             let tmp = data_dir
                 .join("tmp")
                 .join(format!("idx_{}_{}_g{}.hnsw.tmp", tid, col_idx, dt.generation));
-            hnsw.save_snapshot(&snap, &tmp)?;
+            hnsw.save_snapshot_for_table(&snap, &tmp)?;
         }
     }
 

@@ -13,10 +13,10 @@
 ## 2. 向量索引方案
 
 - **精确检索（`exact`）**：采用 8 路循环展开 + 运行时 AVX2/FMA 加速的平方 L2 距离（`f64` 累加防中间平方溢出），结合先 `WHERE` 过滤后 `BinaryHeap` 最大堆截取 TopK（`O(N log K)` 时间、`O(K)` 空间），距离并列时按主键升序排列，仅最终投影执行 `sqrt()`。
-- **近似检索（`ann`）**：自主实现 HNSW 图索引（`M=20, M0=40, ef_construction=160, ef_search=256`），采用 Algorithm 4 启发式选边与访问代际表（零每查询堆分配）。
+- **近似检索（`ann`）**：自主实现 HNSW 图索引（`M=16, M0=32, ef_construction=120, ef_search=128`，高维大数据量下自动提升搜索 `ef`），结合 AVX2+FMA 32 路展开纯 `f32` 快速距离核（分量 `|x| < 1e15` 时启用）、8 字节紧凑 `Neighbor(id, signed_dist)` 缓存邻居距离与多样性标记、增量反向边启发式剪枝 `add_neighbor_heuristic_incremental` 以及访问代际表（零每查询堆分配）。
   - **过滤 ANN**：保留图节点连通性自由扩展邻居，仅对存活且通过 `WHERE` 谓词的节点入堆；若低选择率导致图检索不足 `K` 条，自动回退至带过滤的精确堆扫描，保证结果有效、无重复且召回率达标。
-  - **有界向量溢写**：`VectorStore` 在 `<= 512 MiB` 时常驻连续 `Vec<f32>`；超过阈值自动溢写至 `idx_<tid>_<col>_g<gen>.vec` 并切换为有界 LRU + `pread`。
-  - **索引维护与持久化**：支持 `INSERT`/`UPDATE`/`DELETE` 增量维护（死节点比例过高时自动重建）、`checkpoint` 时保存 `.hnsw` 快照、重启恢复后增量重建或加载。
+  - **有界向量溢写**：`VectorStore` 在 `<= 512 MiB` 时常驻连续 `Vec<f32>`；超过阈值自动溢写至 `idx_<tid>_<col>_g<gen>.vec` 并切换为带代数序号的 LRU + `pread`。
+  - **流式紧凑快照与免冗余持久化**：`save_snapshot_for_table` 通过 64 KiB `CrcWriter` 流式落盘，在未溢写时采用 `storage_mode = 2`（External Table Store）仅持久化图拓扑与 `u16` 紧凑邻居列表，复用 `.dat` 中的向量数据，将 10,000×128 维索引快照从 `7.01 MiB` 压缩至 `872 KB`；`dirty` 标志与 `shutdown` 缓存预释放机制进一步消除了只读重启容器的落盘开销与关闭阶段的峰值内存冲高。
 
 ## 3. 事务处理、提交持久化与崩溃恢复
 

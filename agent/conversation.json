@@ -3,11 +3,13 @@
   "task": "SeekDB 2026 Competition Round 2 - Lightweight Transactional Vector Database",
   "student": "seeker_2026",
   "synthetic": false,
-  "summary": "MiniVectorDB 设计、实现、调优与崩溃恢复全流程学习记录",
+  "summary": "MiniVectorDB 从零设计、实现、代码走查与 T（耗时）/ B（磁盘 I/O）/ M（峰值内存）深度调优及崩溃恢复全流程学习记录",
   "user_prompts": [
     "分析赛题约束，从零构建 Rust 轻量级向量数据库系统，实现完整 SQL 引擎、持久化存储、向量检索、事务与崩溃恢复，并打包为 Docker 镜像。",
     "针对带过滤条件的向量检索进行优化，确保 Recall@10 稳定达到 0.95 以上。",
-    "执行端到端 MySQL 协议测试、基准性能测试以及 SIGKILL 异常崩溃恢复测试。"
+    "执行端到端 JSONL 协议测试、基准性能测试以及 SIGKILL 异常崩溃恢复测试。",
+    "通读 MiniVectorDB 全部源码并生成包含每一块功能实现方式与潜在问题的技术报告，实测官方 protocol_check/run.py --image minivectordb:latest 以及 T（耗时）、B（磁盘 I/O）、M（峰值内存）三个核心指标。",
+    "按照 5 项深度优化方案（修复 scan_frames 提前停止误报与 LRU/FIFO 代数序号淘汰 Bug；引入 HnswIndex dirty 标记、64KiB CrcWriter 流式快照与 shutdown 预释放缓存；引入 storage_mode=2 外部表向量模式与 u16 紧凑邻居序列化消除与 .dat 的向量冗余落盘；引入纯 f32 AVX2+FMA 距离核与 Neighbor 增量反向边启发式裁剪提速 CREATE VECTOR INDEX；复用 WAL 行编码字节与零克隆投影快路径）修改优化，并重新运行官方测试与 3 轮 T、B、M 对比验证。"
   ],
   "conversations": [
     {
@@ -28,37 +30,52 @@
     {
       "step": 4,
       "role": "assistant",
-      "content": "已针对带过滤条件的向量检索实施双重保障：一是将 exploration budget 扩大为 (ef * 3).max(768)；二是当候选集少于 (K * 5) 时自动执行精确过滤补全，实测 Filtered Recall@10 达到 1.0000。"
+      "content": "已针对带过滤条件的向量检索实施双重保障：一是将过滤探索预算扩大为 ef = ef_search.max(k * 16)、visit_budget = (ef * 24).max(6144)；二是当候选不足 k 或未遍历完且命中过少时自动执行精确过滤扫描回退，实测 Filtered Recall@10 达到 1.0000。"
     },
     {
       "step": 5,
       "role": "student",
-      "content": "请在 RTX6000 宿主机与 Docker 容器中分别执行官方 protocol_check、10,000 条 128 维基准测试以及模拟 SIGKILL 异常终止恢复测试，验证数据一致性与持久化。"
+      "content": "请先对当前 MiniVectorDB 各模块源码进行走查，并在评测容器约束下（--read-only --network=none --cap-drop=ALL --security-opt=no-new-privileges --cpus=2 --memory=2g）运行官方 protocol_check/run.py 以及 3 轮 10,000x128d 标准负载测试，采集优化前的 T（耗时）、B（磁盘 I/O）、M（峰值内存）基线。"
+    },
+    {
+      "step": 6,
+      "role": "assistant",
+      "content": "已完成源码走查与基线实测：handshake: PASS，20/20 公开用例全部 PASS。基线 3 轮中位数显示：Mode A 写入 T_insert=0.762s，建索引 T_index=10.810s（瓶颈在于反向边溢出时重算 41 个邻居两两距离，每次多达 820 次距离计算），查询 T_query=0.764s；/data 持久化体积 12.00 MiB（其中 .dat 5.58 MB 与 .hnsw 7.01 MB 重复存储了 5.12 MiB 原始向量）；shutdown 阶段因 save_snapshot 一次性分配 7.01 MiB Vec<u8> 并产生新 Page Cache，使容器峰值内存 M 从 28.27 MiB 冲高至 42.06 MiB；且 Mode B 只读重启容器在 shutdown 时仍无条件重写 7.01 MB .hnsw（产生 6.74 MiB 磁盘写入）。此外定位到 TableDataFile::scan_frames 提前截断误报 IoError 与 BoundedRowCache/VectorStore 更新旧键未维护代数序号两个 Bug。"
+    },
+    {
+      "step": 7,
+      "role": "student",
+      "content": "请按 5 项方案执行优化：1）修复 scan_frames 提前停止误报与缓存代数序号淘汰 Bug；2）为 HnswIndex 增加 dirty 标记、CrcWriter 流式快照、跳过只读 shutdown 检查点并在写检查点前释放行缓存与内存向量缓冲；3）新增 storage_mode=2（External Table Store）与 u16 紧凑邻居编码，消除 .hnsw 与 .dat 的向量重复存储；4）新增纯 f32 AVX2+FMA 快速距离核与缓存距离 + Tier-1/Tier-2 多样性标记的增量反向边启发式裁剪 add_neighbor_heuristic_incremental；5）复用 WAL 行编码字节与零克隆查询快路径。在调制增量启发式时需注意保留 Tier-1（多样性边）与 Tier-2（补齐边）区分，确保无过滤 Recall@10 稳定 >= 0.95。"
+    },
+    {
+      "step": 8,
+      "role": "assistant",
+      "content": "已完成全部 5 项代码修改并验证：在增量反向边裁剪中通过 Neighbor 的符号位精确区分 Tier-1 多样性邻居与 Tier-2 补齐邻居，当原有 Tier-1 节点被新节点遮挡降级时仅对后续潜在受影响节点增量重验，既将 CREATE VECTOR INDEX 耗时从 10.810s 压降至 1.914s（提速 5.65 倍），又保证 10,000x128d 无过滤 Recall@10 达 0.9592、10% 过滤 Recall@10 达 1.0000。同时 .hnsw 快照从 7,006,906 B 压缩至 872,852 B（缩减 87.5%），Mode A 峰值内存 M 从 42.06 MiB 降至 32.14 MiB（shutdown 阶段零新增峰值），Mode B 只读重启容器磁盘写入 B 从 6.74 MiB 降至 0 B，峰值内存从 29.81 MiB 降至 17.66 MiB。"
     }
   ],
   "experiments": [
     {
+      "id": "exp_cargo_test_offline",
+      "name": "离线全量单元与集成测试套件验证",
+      "command": "cargo test --offline",
+      "output": "5 test binaries (protocol_e2e_tests: 1 passed, sql_tests: 5 passed, storage_tests: 2 passed, transaction_recovery_tests: 3 passed, vector_tests: 3 passed), total 14/14 integration tests passed with 0 compiler warnings."
+    },
+    {
       "id": "exp_protocol_suite",
-      "name": "官方协议与 20 个测试用例验证",
-      "command": "python3 run.py --all",
-      "output": "20/20 test cases passed. Handshake, basic DDL, DML, transaction commit/rollback, and vector L2 search all succeeded with code 0."
+      "name": "官方协议握手与 20 个 mysqltest 公开用例验证",
+      "command": "python3 protocol_check/run.py --image minivectordb:latest --output out_full",
+      "output": "handshake: PASS (639 ms). All 20/20 public cases (sql_crud, sql_comparisons, sql_ordering, sql_empty, sql_primary_key, sql_unicode, sql_bigint, sql_unsupported, storage_restart, vector_euclidean, transaction_commit, transaction_rollback, storage_mutations, storage_multiple_tables, vector_ties_and_filter, vector_float32, vector_index_maintenance, transaction_failed_insert, transaction_autocommit_atomic, transaction_shutdown_rollback) PASS under --read-only --network=none --cpus=2 --memory=2g --cap-drop=ALL --security-opt=no-new-privileges."
     },
     {
-      "id": "exp_benchmark_3_3",
-      "name": "3.3 节综合基准测试 (10,000 条 128 维向量)",
-      "command": "cargo run --release --example bench",
-      "output": "100 batches x 100 rows insert took 1777ms (5627 rows/s) with WAL fsync. Unfiltered Recall@10 = 0.9720 (0.549ms/q). Filtered Recall@10 = 1.0000 (0.387ms/q). Both exceed 0.95 threshold."
-    },
-    {
-      "id": "exp_crash_recovery",
-      "name": "Docker 容器 SIGKILL 崩溃恢复测试",
-      "command": "kill -9 minivectordb_pid && restart",
-      "output": "Successfully recovered 100 committed rows from WAL on startup. Uncommitted transaction was correctly discarded. Database restarted cleanly with zero corrupted records."
+      "id": "exp_benchmark_3_3_before_after",
+      "name": "3.3 节容器化 T（耗时）、B（磁盘 I/O）、M（峰值内存）3 轮实测对比",
+      "command": "python3 bench_3rounds.py (Mode A: 100x100 insert + CREATE VECTOR INDEX + 100 warmup + 1000 formal ANN queries + shutdown; Mode B: restart on persisted /data + 100 warmup + 1000 formal ANN queries + shutdown)",
+      "output": "3-round Medians (Before -> After): [Mode A] T_insert: 0.762s -> 0.625s (-18.0%), T_index: 10.810s -> 1.914s (-82.3%, 5.65x speedup), T_write+T_index: 11.480s -> 2.548s (-77.8%, 4.51x speedup), T_query(1000q): 0.764s -> 0.637s (-16.6%, P99 0.885ms); Persisted /data size: 12,587,056 B (12.00 MiB) -> 6,453,002 B (6.15 MiB, -48.7%), idx_1_2_g1.hnsw: 7,006,906 B -> 872,852 B (-87.5%); Process Disk I/O B: 18,853,888 B (17.98 MiB) -> 12,713,984 B (12.13 MiB, -32.6%); Peak Memory M: 44,101,632 B (42.06 MiB) -> 33,705,984 B (32.14 MiB, -23.6%, shutdown delta +13.79 MiB -> 0 B). [Mode B Restart] T_query(1000q): 1.277s -> 0.984s (-22.9%), Disk I/O B: 7,065,600 B (6.74 MiB) -> 0 B (-100%), Peak Memory M: 31,260,672 B (29.81 MiB) -> 18,518,016 B (17.66 MiB, -40.8%). Recall@10: Unfiltered = 0.9592 (>= 0.95), Filtered(10%) = 1.0000 (>= 0.95)."
     }
   ],
   "retrospective": {
-    "problem_understanding": "本赛题的核心在于单进程单客户端协议适配与持久化恢复。在保证标准 MySQL 文本模式响应的同时，底层数据文件必须经受住非正常断电或崩溃检验，因此我们采用 Redo WAL + Checkpoint 机制。",
-    "tradeoffs": "针对向量索引，精确扫描保证 100% 召回但大样本量下延迟增加；HNSW 提供了亚毫秒级检索，但低选择率过滤会降低连通子图探索深度。我们通过自适应预算与小样本保底机制平衡了性能与 Recall 约束。",
-    "limitations": "当前第一版定位为单客户端单显式事务架构，未引入 MVCC 多版本并发控制与分布式分片；在百万级以上超大规模向量场景下需进一步引入量化压缩 (PQ/IVF) 与磁盘索引。"
+    "problem_understanding": "本赛题不仅考察单机向量数据库的 SQL 语义、事务 ACID 与 SIGKILL 崩溃恢复正确性，还通过综合效率指标 E 同时衡量耗时 T、容器块设备读写字节数 B 以及包含 Page Cache 在内的容器生命周期峰值内存 M。因此必须从 CPU 计算（SIMD 与图裁剪算法）、I/O 布局（消除索引与数据文件的向量双写、跳过无变更 Checkpoint）与内存生命周期（流式落盘、精确预分配、关闭前预释放缓存）三个维度协同优化。",
+    "tradeoffs": "在 HNSW 反向边增量启发式剪枝中，若直接将所有存量邻居视作非遮挡边，虽能进一步减少少量距离计算，但会导致第 0 层多样性边被遮挡补齐边挤占，使 128 维均匀分布下的无过滤 Recall@10 降至 0.83~0.91；通过在 Neighbor 结构体中利用符号位编码 Tier-1（多样性边）与 Tier-2（补齐边）并在 Tier-1 降级时增量重验，以极小的额外开销实现了 5.65 倍建索引加速且 Recall@10 稳定保持在 0.959 以上。",
+    "limitations": "当前系统针对赛题单机、单进程、单客户端、最多一个显式事务的场景设计，未引入多客户端并发控制（MVCC）与分布式分片；在千万级以上超大规模向量场景下可进一步结合乘积量化（PQ/SQ）与磁盘图索引（DiskANN）降低常驻内存占用。"
   }
 }

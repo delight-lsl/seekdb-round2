@@ -324,6 +324,7 @@ pub struct WalManager {
     pub current_seq: u64,
     pub current_offset: u64,
     pub next_txn_id: TxnId,
+    pub dirty_since_checkpoint: bool,
     file: File,
 }
 
@@ -348,6 +349,7 @@ impl WalManager {
             current_seq: seq,
             current_offset: cur_off,
             next_txn_id: next_txn_id.max(1),
+            dirty_since_checkpoint: false,
             file,
         })
     }
@@ -375,6 +377,7 @@ impl WalManager {
         self.file.flush()?;
         self.file.sync_all()?;
         self.current_offset += buf.len() as u64;
+        self.dirty_since_checkpoint = true;
         Ok(txn_id)
     }
 
@@ -397,6 +400,7 @@ impl WalManager {
         self.file = file;
         self.current_seq = next_seq;
         self.current_offset = 0;
+        self.dirty_since_checkpoint = false;
         Ok((next_seq, 0))
     }
 

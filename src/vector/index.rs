@@ -1,17 +1,79 @@
 use crate::common::error::{DbError, ErrorCode, Result};
-use crate::common::types::RowId;
-use crate::storage::codec::{write_i64, write_u32, write_u64, write_u8, Cursor};
-use crate::storage::file::atomic_write_file;
-use crate::vector::distance::l2_distance_squared_unchecked;
+use crate::common::types::{RowId, Value};
+use crate::storage::codec::Cursor;
+use crate::storage::engine::DiskTable;
+use crate::storage::file::sync_dir;
+use crate::vector::distance::{l2_distance_squared_f32_fast, l2_distance_squared_unchecked};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 const HNSW_MAGIC: [u8; 4] = *b"HNS1";
 const MAX_INMEM_VECTOR_BYTES: usize = 512 * 1024 * 1024; // 512 MiB heap budget for HNSW vectors
+const COMPACT_NEIGHBORS_FLAG: u8 = 0x80;
+
+struct CrcWriter<W: Write> {
+    inner: BufWriter<W>,
+    hasher: crc32fast::Hasher,
+}
+
+impl<W: Write> CrcWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            inner: BufWriter::with_capacity(64 * 1024, writer),
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.hasher.update(bytes);
+        self.inner.write_all(bytes)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_u8(&mut self, v: u8) -> Result<()> {
+        self.write_bytes(&[v])
+    }
+
+    #[inline]
+    fn write_u16(&mut self, v: u16) -> Result<()> {
+        self.write_bytes(&v.to_le_bytes())
+    }
+
+    #[inline]
+    fn write_u32(&mut self, v: u32) -> Result<()> {
+        self.write_bytes(&v.to_le_bytes())
+    }
+
+    #[inline]
+    fn write_u64(&mut self, v: u64) -> Result<()> {
+        self.write_bytes(&v.to_le_bytes())
+    }
+
+    #[inline]
+    fn write_i64(&mut self, v: i64) -> Result<()> {
+        self.write_bytes(&v.to_le_bytes())
+    }
+
+    fn finish(mut self) -> Result<W> {
+        let crc = self.hasher.finalize();
+        self.inner.write_all(&crc.to_le_bytes())?;
+        self.inner.flush()?;
+        self.inner
+            .into_inner()
+            .map_err(|e| DbError::from(e.into_error()))
+    }
+}
+
+#[inline]
+fn is_slice_safe_for_f32(v: &[f32]) -> bool {
+    v.iter().all(|&x| x.abs() < 1e15)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DistNode {
@@ -44,10 +106,12 @@ struct VectorStore {
     spilled: bool,
     spill_path: PathBuf,
     spill_file: Option<File>,
-    lru_map: HashMap<u32, Vec<f32>>,
-    lru_order: VecDeque<u32>,
+    lru_map: HashMap<u32, (Vec<f32>, u64)>,
+    lru_order: VecDeque<(u32, u64)>,
+    lru_gen: u64,
     max_cached_nodes: usize,
     max_inmem_bytes: usize,
+    safe_for_f32_dist: bool,
 }
 
 impl VectorStore {
@@ -66,13 +130,18 @@ impl VectorStore {
             spill_file: None,
             lru_map: HashMap::new(),
             lru_order: VecDeque::new(),
+            lru_gen: 0,
             max_cached_nodes,
             max_inmem_bytes,
+            safe_for_f32_dist: true,
         }
     }
 
     fn append(&mut self, node_id: u32, vec: &[f32]) -> Result<()> {
         debug_assert_eq!(vec.len(), self.dim);
+        if self.safe_for_f32_dist && !is_slice_safe_for_f32(vec) {
+            self.safe_for_f32_dist = false;
+        }
         if !self.spilled {
             let needed_bytes = (node_id as usize + 1) * self.dim * 4;
             if needed_bytes <= self.max_inmem_bytes {
@@ -102,7 +171,7 @@ impl VectorStore {
             .write(true)
             .truncate(true)
             .open(&self.spill_path)?;
-        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, &file);
+        let mut writer = BufWriter::with_capacity(256 * 1024, &file);
         for &x in &self.in_mem {
             writer.write_all(&x.to_le_bytes())?;
         }
@@ -125,33 +194,78 @@ impl VectorStore {
 
     fn insert_lru(&mut self, node_id: u32, vec: Vec<f32>) {
         if self.lru_map.contains_key(&node_id) {
-            self.lru_map.insert(node_id, vec);
+            self.lru_gen = self.lru_gen.wrapping_add(1);
+            let g = self.lru_gen;
+            self.lru_map.insert(node_id, (vec, g));
+            self.lru_order.push_back((node_id, g));
             return;
         }
         while self.lru_map.len() >= self.max_cached_nodes {
-            let Some(evict) = self.lru_order.pop_front() else {
+            let Some((evict, egen)) = self.lru_order.pop_front() else {
                 break;
             };
-            self.lru_map.remove(&evict);
+            if self
+                .lru_map
+                .get(&evict)
+                .is_some_and(|&(_, g)| g == egen)
+            {
+                self.lru_map.remove(&evict);
+            }
         }
-        self.lru_order.push_back(node_id);
-        self.lru_map.insert(node_id, vec);
+        self.lru_gen = self.lru_gen.wrapping_add(1);
+        let g = self.lru_gen;
+        self.lru_order.push_back((node_id, g));
+        self.lru_map.insert(node_id, (vec, g));
     }
 
     #[inline]
-    fn dist_to_query(&mut self, node_id: u32, query: &[f32]) -> Result<f64> {
+    fn prefetch_node(&self, node_id: u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !self.spilled {
+                let start = (node_id as usize) * self.dim;
+                if start < self.in_mem.len() {
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        let ptr = self.in_mem.as_ptr().add(start) as *const i8;
+                        _mm_prefetch(ptr, _MM_HINT_T0);
+                        if self.dim > 16 {
+                            _mm_prefetch(ptr.add(64), _MM_HINT_T0);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = node_id;
+        }
+    }
+
+    #[inline]
+    fn compute_dist(&self, a: &[f32], b: &[f32], b_safe: bool) -> f64 {
+        if self.safe_for_f32_dist && b_safe {
+            l2_distance_squared_f32_fast(a, b) as f64
+        } else {
+            l2_distance_squared_unchecked(a, b)
+        }
+    }
+
+    #[inline]
+    fn dist_to_query(&mut self, node_id: u32, query: &[f32], query_safe: bool) -> Result<f64> {
         if !self.spilled {
             let start = (node_id as usize) * self.dim;
-            return Ok(l2_distance_squared_unchecked(
+            return Ok(self.compute_dist(
                 &self.in_mem[start..start + self.dim],
                 query,
+                query_safe,
             ));
         }
-        if let Some(v) = self.lru_map.get(&node_id) {
-            return Ok(l2_distance_squared_unchecked(v, query));
+        if let Some((v, _)) = self.lru_map.get(&node_id) {
+            return Ok(self.compute_dist(v, query, query_safe));
         }
         let v = self.read_from_spill(node_id)?;
-        let d = l2_distance_squared_unchecked(&v, query);
+        let d = self.compute_dist(&v, query, query_safe);
         self.insert_lru(node_id, v);
         Ok(d)
     }
@@ -175,13 +289,17 @@ impl VectorStore {
         if !self.spilled {
             let sa = (a as usize) * self.dim;
             let sb = (b as usize) * self.dim;
-            return Ok(l2_distance_squared_unchecked(
-                &self.in_mem[sa..sa + self.dim],
-                &self.in_mem[sb..sb + self.dim],
-            ));
+            let va = &self.in_mem[sa..sa + self.dim];
+            let vb = &self.in_mem[sb..sb + self.dim];
+            if self.safe_for_f32_dist {
+                return Ok(l2_distance_squared_f32_fast(va, vb) as f64);
+            } else {
+                return Ok(l2_distance_squared_unchecked(va, vb));
+            }
         }
         let va = self.get_owned(a)?;
-        self.dist_to_query(b, &va)
+        let va_safe = self.safe_for_f32_dist && is_slice_safe_for_f32(&va);
+        self.dist_to_query(b, &va, va_safe)
     }
 
     fn get_owned(&mut self, node_id: u32) -> Result<Vec<f32>> {
@@ -189,12 +307,65 @@ impl VectorStore {
             let start = (node_id as usize) * self.dim;
             return Ok(self.in_mem[start..start + self.dim].to_vec());
         }
-        if let Some(v) = self.lru_map.get(&node_id) {
+        if let Some((v, _)) = self.lru_map.get(&node_id) {
             return Ok(v.clone());
         }
         let v = self.read_from_spill(node_id)?;
         self.insert_lru(node_id, v.clone());
         Ok(v)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Neighbor {
+    id: u32,
+    /// `>= 0.0`: Tier-1 diverse neighbor with `dist = signed_dist`.
+    /// `< 0.0` (and `!= NEG_INFINITY`): Tier-2 padding neighbor with `dist = -signed_dist - 1.0`.
+    /// `NEG_INFINITY`: lazy uninitialized distance after `load_snapshot`.
+    signed_dist: f32,
+}
+
+impl Neighbor {
+    #[inline]
+    fn new(id: u32, dist: f32, diverse: bool) -> Self {
+        let d = dist.max(0.0);
+        Self {
+            id,
+            signed_dist: if diverse { d } else { -(d + 1.0) },
+        }
+    }
+
+    #[inline]
+    fn uninit(id: u32) -> Self {
+        Self {
+            id,
+            signed_dist: f32::NEG_INFINITY,
+        }
+    }
+
+    #[inline]
+    fn is_uninit(self) -> bool {
+        self.signed_dist == f32::NEG_INFINITY
+    }
+
+    #[inline]
+    fn is_diverse(self) -> bool {
+        self.signed_dist >= 0.0
+    }
+
+    #[inline]
+    fn dist(self) -> f32 {
+        if self.signed_dist >= 0.0 {
+            self.signed_dist
+        } else {
+            -self.signed_dist - 1.0
+        }
+    }
+
+    #[inline]
+    fn set_diverse(&mut self, diverse: bool) {
+        let d = self.dist();
+        self.signed_dist = if diverse { d } else { -(d + 1.0) };
     }
 }
 
@@ -204,7 +375,7 @@ struct HnswNode {
     pk: Option<i64>,
     level: u8,
     deleted: bool,
-    neighbors: Vec<Vec<u32>>,
+    neighbors: Vec<Vec<Neighbor>>,
 }
 
 /// Autonomous HNSW approximate nearest neighbor index with bounded memory,
@@ -226,6 +397,8 @@ pub struct HnswIndex {
     vectors: VectorStore,
     visited: Vec<u32>,
     visit_gen: u32,
+    dirty: bool,
+    needs_table_vectors: bool,
 }
 
 impl HnswIndex {
@@ -239,14 +412,14 @@ impl HnswIndex {
         spill_path: PathBuf,
         max_cache_bytes: usize,
     ) -> Self {
-        let m = 20;
+        let m = 16;
         Self {
             index_name,
             dim,
             m,
             m0: m * 2,
-            ef_construction: 160,
-            ef_search: 256,
+            ef_construction: 120,
+            ef_search: 128,
             m_l: 1.0 / (m as f64).ln(),
             nodes: Vec::new(),
             row_to_node: HashMap::new(),
@@ -256,11 +429,29 @@ impl HnswIndex {
             vectors: VectorStore::with_limit(dim, spill_path, max_cache_bytes),
             visited: Vec::new(),
             visit_gen: 0,
+            dirty: true,
+            needs_table_vectors: false,
         }
     }
 
     pub fn is_spilled(&self) -> bool {
         self.vectors.spilled
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    pub fn is_safe_for_f32_dist(&self) -> bool {
+        self.vectors.safe_for_f32_dist
+    }
+
+    pub fn needs_table_vectors(&self) -> bool {
+        self.needs_table_vectors
     }
 
     pub fn live_count(&self) -> usize {
@@ -273,6 +464,28 @@ impl HnswIndex {
 
     pub fn needs_rebuild(&self) -> bool {
         self.nodes.len() > 512 && self.live_count * 2 < self.nodes.len()
+    }
+
+    pub fn reserve(&mut self, n_nodes: usize) {
+        self.nodes.reserve_exact(n_nodes);
+        self.row_to_node.reserve(n_nodes);
+        self.visited.reserve_exact(n_nodes);
+        if !self.vectors.spilled {
+            let needed_floats = n_nodes.saturating_mul(self.dim);
+            if needed_floats * std::mem::size_of::<f32>() <= self.vectors.max_inmem_bytes {
+                self.vectors.in_mem.reserve_exact(needed_floats);
+            }
+        }
+    }
+
+    /// Free in-memory vectors and temporary buffers right before a table-backed (`spilled = 2`) shutdown snapshot.
+    pub fn release_inmem_vectors_for_shutdown(&mut self) {
+        if !self.vectors.spilled {
+            self.vectors.in_mem = Vec::new();
+            self.vectors.in_mem.shrink_to_fit();
+        }
+        self.visited = Vec::new();
+        self.visited.shrink_to_fit();
     }
 
     fn next_visit_gen(&mut self) -> u32 {
@@ -294,7 +507,6 @@ impl HnswIndex {
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^= x >> 31;
-        // Uniform (0, 1] float
         let u = ((x >> 11) as f64 + 0.5) / ((1u64 << 53) as f64);
         let lvl = (-u.ln() * self.m_l).floor() as usize;
         lvl.min(16)
@@ -305,6 +517,7 @@ impl HnswIndex {
             if !self.nodes[nid as usize].deleted {
                 self.nodes[nid as usize].deleted = true;
                 self.live_count = self.live_count.saturating_sub(1);
+                self.dirty = true;
             }
         }
     }
@@ -317,18 +530,26 @@ impl HnswIndex {
             ));
         }
         self.delete(row_id);
+        self.dirty = true;
 
         let nid = u32::try_from(self.nodes.len())
             .map_err(|_| DbError::new(ErrorCode::InternalError, "HNSW node count overflow"))?;
         let level = self.random_level(row_id, nid);
 
         self.vectors.append(nid, vec)?;
+        let vec_safe = self.vectors.safe_for_f32_dist;
+
+        let mut neighbors = Vec::with_capacity(level + 1);
+        for l in 0..=level {
+            let cap = if l == 0 { self.m0 + 1 } else { self.m + 1 };
+            neighbors.push(Vec::with_capacity(cap));
+        }
         self.nodes.push(HnswNode {
             row_id,
             pk,
             level: level as u8,
             deleted: false,
-            neighbors: vec![Vec::new(); level + 1],
+            neighbors,
         });
         self.row_to_node.insert(row_id, nid);
         self.live_count += 1;
@@ -339,10 +560,11 @@ impl HnswIndex {
             return Ok(());
         };
 
-        let mut cur_dist = self.vectors.dist_to_query(cur_ep, vec)?;
+        let mut cur_dist = self.vectors.dist_to_query(cur_ep, vec, vec_safe)?;
         if self.max_level > level {
             for l in (level + 1..=self.max_level).rev() {
-                let (next_ep, next_dist) = self.greedy_search_layer(vec, cur_ep, cur_dist, l)?;
+                let (next_ep, next_dist) =
+                    self.greedy_search_layer(vec, vec_safe, cur_ep, cur_dist, l)?;
                 cur_ep = next_ep;
                 cur_dist = next_dist;
             }
@@ -350,7 +572,8 @@ impl HnswIndex {
 
         let top_connect = level.min(self.max_level);
         for l in (0..=top_connect).rev() {
-            let candidates = self.search_layer(vec, cur_ep, cur_dist, self.ef_construction, l)?;
+            let candidates =
+                self.search_layer(vec, vec_safe, cur_ep, cur_dist, self.ef_construction, l)?;
             if let Some(best) = candidates.first() {
                 cur_ep = best.node_id;
                 cur_dist = best.dist;
@@ -360,21 +583,7 @@ impl HnswIndex {
             self.nodes[nid as usize].neighbors[l] = selected.clone();
 
             for &nb in &selected {
-                self.nodes[nb as usize].neighbors[l].push(nid);
-                if self.nodes[nb as usize].neighbors[l].len() > max_links {
-                    let nb_links = std::mem::take(&mut self.nodes[nb as usize].neighbors[l]);
-                    let mut nb_cands = Vec::with_capacity(nb_links.len());
-                    for link_id in nb_links {
-                        let d = self.vectors.dist_between(nb, link_id)?;
-                        nb_cands.push(DistNode {
-                            dist: d,
-                            node_id: link_id,
-                        });
-                    }
-                    nb_cands.sort();
-                    let pruned = self.select_neighbors_heuristic(&nb_cands, max_links)?;
-                    self.nodes[nb as usize].neighbors[l] = pruned;
-                }
+                self.add_neighbor_heuristic_incremental(nb.id, l, nid, nb.dist(), max_links)?;
             }
         }
 
@@ -385,9 +594,173 @@ impl HnswIndex {
         Ok(())
     }
 
+    fn ensure_neighbor_distances_populated(&mut self, nb: u32, layer: usize) -> Result<()> {
+        let needs_init = self.nodes[nb as usize].neighbors[layer]
+            .iter()
+            .any(|n| n.is_uninit());
+        if !needs_init {
+            return Ok(());
+        }
+        let links = std::mem::take(&mut self.nodes[nb as usize].neighbors[layer]);
+        let mut cands = Vec::with_capacity(links.len());
+        for item in links {
+            let d = self.vectors.dist_between(nb, item.id)?;
+            cands.push(DistNode {
+                dist: d,
+                node_id: item.id,
+            });
+        }
+        cands.sort();
+        let max_links = if layer == 0 { self.m0 } else { self.m };
+        self.nodes[nb as usize].neighbors[layer] =
+            self.select_neighbors_heuristic(&cands, max_links)?;
+        Ok(())
+    }
+
+    fn add_neighbor_heuristic_incremental(
+        &mut self,
+        nb: u32,
+        layer: usize,
+        new_nid: u32,
+        new_dist: f32,
+        max_links: usize,
+    ) -> Result<()> {
+        self.ensure_neighbor_distances_populated(nb, layer)?;
+
+        let cur_len = self.nodes[nb as usize].neighbors[layer].len();
+        let ins_idx = self.nodes[nb as usize].neighbors[layer].partition_point(|n| {
+            n.dist()
+                .total_cmp(&new_dist)
+                .then_with(|| n.id.cmp(&new_nid))
+                == Ordering::Less
+        });
+
+        // Fast exit: if list is already full of Tier-1 neighbors and `new_nid` is farther than all of them,
+        // it can never be retained even if diverse.
+        if cur_len >= max_links
+            && ins_idx >= max_links
+            && self.nodes[nb as usize].neighbors[layer]
+                .iter()
+                .all(|n| n.is_diverse())
+        {
+            return Ok(());
+        }
+
+        // Test occlusion ONLY against closer Tier-1 (diverse) neighbors
+        let mut new_diverse = true;
+        for i in 0..ins_idx {
+            let w = self.nodes[nb as usize].neighbors[layer][i];
+            if w.is_diverse() {
+                let d_uw = self.vectors.dist_between(new_nid, w.id)? as f32;
+                if d_uw < new_dist {
+                    new_diverse = false;
+                    break;
+                }
+            }
+        }
+
+        if !new_diverse {
+            if cur_len < max_links {
+                self.nodes[nb as usize].neighbors[layer]
+                    .insert(ins_idx, Neighbor::new(new_nid, new_dist, false));
+                return Ok(());
+            }
+            // Find the farthest Tier-2 (!is_diverse) neighbor; replace it only if `new_dist` is closer
+            if let Some(last_t2) = self.nodes[nb as usize].neighbors[layer]
+                .iter()
+                .rposition(|n| !n.is_diverse())
+            {
+                if new_dist < self.nodes[nb as usize].neighbors[layer][last_t2].dist() {
+                    self.nodes[nb as usize].neighbors[layer].remove(last_t2);
+                    let pos = self.nodes[nb as usize].neighbors[layer].partition_point(|n| {
+                        n.dist()
+                            .total_cmp(&new_dist)
+                            .then_with(|| n.id.cmp(&new_nid))
+                            == Ordering::Less
+                    });
+                    self.nodes[nb as usize].neighbors[layer]
+                        .insert(pos, Neighbor::new(new_nid, new_dist, false));
+                }
+            }
+            return Ok(());
+        }
+
+        // `new_nid` is a Tier-1 diverse neighbor; insert at `ins_idx`
+        self.nodes[nb as usize].neighbors[layer]
+            .insert(ins_idx, Neighbor::new(new_nid, new_dist, true));
+
+        let new_len = self.nodes[nb as usize].neighbors[layer].len();
+        let mut any_demoted = false;
+        let mut promoted_ids: [u32; 32] = [0; 32];
+        let mut promoted_len = 0usize;
+
+        for i in (ins_idx + 1)..new_len {
+            let item = self.nodes[nb as usize].neighbors[layer][i];
+            let item_dist = item.dist();
+            if item.is_diverse() {
+                // Existing Tier-1 node: already non-occluded by all old Tier-1 nodes in `0..i`.
+                // Only check against `new_nid` and any newly promoted nodes.
+                let mut occluded =
+                    (self.vectors.dist_between(item.id, new_nid)? as f32) < item_dist;
+                if !occluded {
+                    for &pid in &promoted_ids[..promoted_len] {
+                        if (self.vectors.dist_between(item.id, pid)? as f32) < item_dist {
+                            occluded = true;
+                            break;
+                        }
+                    }
+                }
+                if occluded {
+                    self.nodes[nb as usize].neighbors[layer][i].set_diverse(false);
+                    any_demoted = true;
+                }
+            } else if any_demoted {
+                // Existing Tier-2 node when an earlier Tier-1 node was demoted:
+                // check `new_nid` first before scanning `0..i`.
+                if (self.vectors.dist_between(item.id, new_nid)? as f32) < item_dist {
+                    continue;
+                }
+                let mut occluded = false;
+                for j in 0..i {
+                    if j == ins_idx {
+                        continue;
+                    }
+                    let prev = self.nodes[nb as usize].neighbors[layer][j];
+                    if prev.is_diverse() {
+                        let d = self.vectors.dist_between(item.id, prev.id)? as f32;
+                        if d < item_dist {
+                            occluded = true;
+                            break;
+                        }
+                    }
+                }
+                if !occluded {
+                    self.nodes[nb as usize].neighbors[layer][i].set_diverse(true);
+                    if promoted_len < promoted_ids.len() {
+                        promoted_ids[promoted_len] = item.id;
+                        promoted_len += 1;
+                    }
+                }
+            }
+        }
+
+        if new_len > max_links {
+            if let Some(last_t2) = self.nodes[nb as usize].neighbors[layer]
+                .iter()
+                .rposition(|n| !n.is_diverse())
+            {
+                self.nodes[nb as usize].neighbors[layer].remove(last_t2);
+            } else {
+                self.nodes[nb as usize].neighbors[layer].pop();
+            }
+        }
+        Ok(())
+    }
+
     fn greedy_search_layer(
         &mut self,
         query: &[f32],
+        query_safe: bool,
         mut cur_id: u32,
         mut cur_dist: f64,
         layer: usize,
@@ -396,11 +769,11 @@ impl HnswIndex {
         let vectors = &mut self.vectors;
         loop {
             let mut changed = false;
-            for &nb in &nodes[cur_id as usize].neighbors[layer] {
-                let d = vectors.dist_to_query(nb, query)?;
+            for nb in &nodes[cur_id as usize].neighbors[layer] {
+                let d = vectors.dist_to_query(nb.id, query, query_safe)?;
                 if d < cur_dist {
                     cur_dist = d;
-                    cur_id = nb;
+                    cur_id = nb.id;
                     changed = true;
                 }
             }
@@ -415,6 +788,7 @@ impl HnswIndex {
     fn search_layer(
         &mut self,
         query: &[f32],
+        query_safe: bool,
         ep_id: u32,
         ep_dist: f64,
         ef: usize,
@@ -441,17 +815,22 @@ impl HnswIndex {
             if cur.dist > worst_res && results.len() >= ef {
                 break;
             }
-            for &nb in &nodes[cur.node_id as usize].neighbors[layer] {
-                if visited[nb as usize] == vgen {
+            let nbs = &nodes[cur.node_id as usize].neighbors[layer];
+            for (i, nb) in nbs.iter().enumerate() {
+                let nb_id = nb.id;
+                if visited[nb_id as usize] == vgen {
                     continue;
                 }
-                visited[nb as usize] = vgen;
-                let d = vectors.dist_to_query(nb, query)?;
+                visited[nb_id as usize] = vgen;
+                if i + 1 < nbs.len() {
+                    vectors.prefetch_node(nbs[i + 1].id);
+                }
+                let d = vectors.dist_to_query(nb_id, query, query_safe)?;
                 let worst_now = results.peek().map_or(f64::INFINITY, |x| x.dist);
                 if results.len() < ef || d < worst_now {
                     let item = DistNode {
                         dist: d,
-                        node_id: nb,
+                        node_id: nb_id,
                     };
                     candidates.push(Reverse(item));
                     results.push(item);
@@ -468,12 +847,9 @@ impl HnswIndex {
         &mut self,
         sorted_candidates: &[DistNode],
         max_links: usize,
-    ) -> Result<Vec<u32>> {
-        if sorted_candidates.len() <= max_links {
-            return Ok(sorted_candidates.iter().map(|c| c.node_id).collect());
-        }
-        let mut selected: Vec<DistNode> = Vec::with_capacity(max_links);
-        let mut discarded: Vec<DistNode> = Vec::new();
+    ) -> Result<Vec<Neighbor>> {
+        let mut selected: Vec<Neighbor> = Vec::with_capacity(sorted_candidates.len().min(max_links));
+        let mut discarded: Vec<Neighbor> = Vec::new();
 
         for &cand in sorted_candidates {
             if selected.len() >= max_links {
@@ -481,27 +857,30 @@ impl HnswIndex {
             }
             let mut closer_to_existing = false;
             for sel in &selected {
-                let inter_dist = self.vectors.dist_between(cand.node_id, sel.node_id)?;
+                let inter_dist = self.vectors.dist_between(cand.node_id, sel.id)?;
                 if inter_dist < cand.dist {
                     closer_to_existing = true;
                     break;
                 }
             }
             if !closer_to_existing {
-                selected.push(cand);
+                selected.push(Neighbor::new(cand.node_id, cand.dist as f32, true));
             } else {
-                discarded.push(cand);
+                discarded.push(Neighbor::new(cand.node_id, cand.dist as f32, false));
             }
         }
 
-        for cand in discarded {
-            if selected.len() >= max_links {
-                break;
+        if selected.len() < max_links && !discarded.is_empty() {
+            for cand in discarded {
+                if selected.len() >= max_links {
+                    break;
+                }
+                selected.push(cand);
             }
-            selected.push(cand);
+            selected.sort_by(|a, b| a.dist().total_cmp(&b.dist()).then_with(|| a.id.cmp(&b.id)));
         }
 
-        Ok(selected.into_iter().map(|c| c.node_id).collect())
+        Ok(selected)
     }
 
     /// Approximate TopK search supporting deleted nodes, txn exclusions, and optional `WHERE` filter.
@@ -529,9 +908,11 @@ impl HnswIndex {
             ));
         }
 
-        let mut cur_dist = self.vectors.dist_to_query(cur_ep, query)?;
+        let query_safe = is_slice_safe_for_f32(query);
+        let mut cur_dist = self.vectors.dist_to_query(cur_ep, query, query_safe)?;
         for l in (1..=self.max_level).rev() {
-            let (next_ep, next_dist) = self.greedy_search_layer(query, cur_ep, cur_dist, l)?;
+            let (next_ep, next_dist) =
+                self.greedy_search_layer(query, query_safe, cur_ep, cur_dist, l)?;
             cur_ep = next_ep;
             cur_dist = next_dist;
         }
@@ -539,6 +920,8 @@ impl HnswIndex {
         let is_filtered = filter_fn.is_some();
         let ef = if is_filtered {
             self.ef_search.max(k.saturating_mul(16))
+        } else if self.dim >= 64 && self.nodes.len() >= 4096 {
+            self.ef_search.max(380).max(k.saturating_mul(4))
         } else {
             self.ef_search.max(k.saturating_mul(4))
         };
@@ -604,21 +987,26 @@ impl HnswIndex {
                 if visits >= visit_budget {
                     break;
                 }
-                // Adaptive bail-out for very low selectivity filters (< ~12%):
+                // Adaptive bail-out for low selectivity filters (< ~12.5%):
                 // hand off early to exact filter-first scan instead of scanning thousands of graph nodes.
-                if live_visited >= 256 && filter_passed * 8 < live_visited {
+                if live_visited >= 96 && filter_passed * 8 < live_visited {
                     return Ok((Vec::new(), false));
                 }
             }
 
-            for &nb in &nodes[cur.node_id as usize].neighbors[0] {
-                if visited[nb as usize] == vgen {
+            let nbs = &nodes[cur.node_id as usize].neighbors[0];
+            for (i, nb) in nbs.iter().enumerate() {
+                let nb_id = nb.id;
+                if visited[nb_id as usize] == vgen {
                     continue;
                 }
-                visited[nb as usize] = vgen;
+                visited[nb_id as usize] = vgen;
                 visits += 1;
+                if i + 1 < nbs.len() {
+                    vectors.prefetch_node(nbs[i + 1].id);
+                }
 
-                let d = vectors.dist_to_query(nb, query)?;
+                let d = vectors.dist_to_query(nb_id, query, query_safe)?;
                 let worst_explore = explore_pool.peek().map_or(f64::INFINITY, |x| x.dist);
                 let explore_cap = if is_filtered { (ef * 3).max(768) } else { ef };
 
@@ -628,7 +1016,7 @@ impl HnswIndex {
                 {
                     let item = DistNode {
                         dist: d,
-                        node_id: nb,
+                        node_id: nb_id,
                     };
                     candidates.push(Reverse(item));
                     explore_pool.push(item);
@@ -637,7 +1025,7 @@ impl HnswIndex {
                     }
                 }
 
-                let node = &nodes[nb as usize];
+                let node = &nodes[nb_id as usize];
                 if !node.deleted && !tx_excluded.contains(&node.row_id) {
                     live_visited += 1;
                     let worst_res = results.peek().map_or(f64::INFINITY, |x| x.dist);
@@ -650,7 +1038,7 @@ impl HnswIndex {
                             filter_passed += 1;
                             results.push(DistNode {
                                 dist: d,
-                                node_id: nb,
+                                node_id: nb_id,
                             });
                             if results.len() > ef {
                                 results.pop();
@@ -681,66 +1069,122 @@ impl HnswIndex {
     }
 
     pub fn save_snapshot(&mut self, snap_path: &Path, tmp_path: &Path) -> Result<()> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&HNSW_MAGIC);
-        write_u32(&mut buf, 1); // version
-        write_u32(&mut buf, self.dim as u32);
-        write_u32(&mut buf, self.m as u32);
-        write_u32(&mut buf, self.m0 as u32);
-        write_u32(&mut buf, self.ef_construction as u32);
-        write_u32(&mut buf, self.max_level as u32);
-        match self.entry_point {
-            Some(ep) => {
-                write_u8(&mut buf, 1);
-                write_u32(&mut buf, ep);
-            }
-            None => {
-                write_u8(&mut buf, 0);
-                write_u32(&mut buf, 0);
-            }
-        }
-        write_u32(&mut buf, self.nodes.len() as u32);
-        write_u32(&mut buf, self.live_count as u32);
-        write_u8(&mut buf, if self.vectors.spilled { 1 } else { 0 });
+        self.save_snapshot_internal(snap_path, tmp_path, false)
+    }
 
-        for node in &self.nodes {
-            write_u64(&mut buf, node.row_id);
-            match node.pk {
-                Some(pk) => {
-                    write_u8(&mut buf, 1);
-                    write_i64(&mut buf, pk);
+    /// Save snapshot for a table-backed index (`spilled = 2` when vectors are in `DiskTable`,
+    /// avoiding duplicate storage of raw vectors already persisted in `.dat`).
+    pub fn save_snapshot_for_table(&mut self, snap_path: &Path, tmp_path: &Path) -> Result<()> {
+        self.save_snapshot_internal(snap_path, tmp_path, true)
+    }
+
+    fn save_snapshot_internal(
+        &mut self,
+        snap_path: &Path,
+        tmp_path: &Path,
+        external_table_vectors: bool,
+    ) -> Result<()> {
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = snap_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let compact_nbs = self.nodes.len() <= (u16::MAX as usize);
+        let storage_mode: u8 = if self.vectors.spilled {
+            1
+        } else if external_table_vectors {
+            2
+        } else {
+            0
+        };
+        let mode_byte = storage_mode | if compact_nbs { COMPACT_NEIGHBORS_FLAG } else { 0 };
+
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(tmp_path)?;
+            let mut w = CrcWriter::new(file);
+            w.write_bytes(&HNSW_MAGIC)?;
+            w.write_u32(1)?; // version
+            w.write_u32(self.dim as u32)?;
+            w.write_u32(self.m as u32)?;
+            w.write_u32(self.m0 as u32)?;
+            w.write_u32(self.ef_construction as u32)?;
+            w.write_u32(self.max_level as u32)?;
+            match self.entry_point {
+                Some(ep) => {
+                    w.write_u8(1)?;
+                    w.write_u32(ep)?;
                 }
                 None => {
-                    write_u8(&mut buf, 0);
-                    write_i64(&mut buf, 0);
+                    w.write_u8(0)?;
+                    w.write_u32(0)?;
                 }
             }
-            write_u8(&mut buf, node.level);
-            write_u8(&mut buf, if node.deleted { 1 } else { 0 });
-            write_u8(&mut buf, node.neighbors.len() as u8);
-            for layer_nbs in &node.neighbors {
-                write_u32(&mut buf, layer_nbs.len() as u32);
-                for &nb in layer_nbs {
-                    write_u32(&mut buf, nb);
+            w.write_u32(self.nodes.len() as u32)?;
+            w.write_u32(self.live_count as u32)?;
+            w.write_u8(mode_byte)?;
+
+            for node in &self.nodes {
+                w.write_u64(node.row_id)?;
+                match node.pk {
+                    Some(pk) => {
+                        w.write_u8(1)?;
+                        w.write_i64(pk)?;
+                    }
+                    None => {
+                        w.write_u8(0)?;
+                        w.write_i64(0)?;
+                    }
+                }
+                w.write_u8(node.level)?;
+                w.write_u8(if node.deleted { 1 } else { 0 })?;
+                w.write_u8(node.neighbors.len() as u8)?;
+                if compact_nbs {
+                    for layer_nbs in &node.neighbors {
+                        w.write_u8(layer_nbs.len() as u8)?;
+                        for nb in layer_nbs {
+                            w.write_u16(nb.id as u16)?;
+                        }
+                    }
+                } else {
+                    for layer_nbs in &node.neighbors {
+                        w.write_u32(layer_nbs.len() as u32)?;
+                        for nb in layer_nbs {
+                            w.write_u32(nb.id)?;
+                        }
+                    }
                 }
             }
+
+            if storage_mode == 0 {
+                w.write_u64(self.vectors.in_mem.len() as u64)?;
+                for &x in &self.vectors.in_mem {
+                    w.write_bytes(&x.to_le_bytes())?;
+                }
+            } else {
+                if self.vectors.spilled {
+                    if let Some(f) = self.vectors.spill_file.as_ref() {
+                        f.sync_all()?;
+                    }
+                }
+                w.write_u64(0)?;
+            }
+
+            let file = w.finish()?;
+            file.sync_all()?;
         }
 
-        if !self.vectors.spilled {
-            write_u64(&mut buf, self.vectors.in_mem.len() as u64);
-            for &x in &self.vectors.in_mem {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
-        } else {
-            if let Some(f) = self.vectors.spill_file.as_ref() {
-                f.sync_all()?;
-            }
-            write_u64(&mut buf, 0);
+        fs::rename(tmp_path, snap_path)?;
+        if let Some(parent) = snap_path.parent() {
+            sync_dir(parent)?;
         }
-
-        let crc = crc32fast::hash(&buf);
-        write_u32(&mut buf, crc);
-        atomic_write_file(snap_path, tmp_path, &buf)
+        self.dirty = false;
+        Ok(())
     }
 
     pub fn load_snapshot(
@@ -778,7 +1222,9 @@ impl HnswIndex {
         let entry_point = if has_ep { Some(ep_raw) } else { None };
         let node_count = cur.read_u32()? as usize;
         let live_count = cur.read_u32()? as usize;
-        let spilled = cur.read_u8()? != 0;
+        let mode_byte = cur.read_u8()?;
+        let compact_nbs = (mode_byte & COMPACT_NEIGHBORS_FLAG) != 0;
+        let storage_mode = mode_byte & !COMPACT_NEIGHBORS_FLAG;
 
         let mut nodes = Vec::with_capacity(node_count);
         let mut row_to_node = HashMap::with_capacity(live_count);
@@ -791,13 +1237,24 @@ impl HnswIndex {
             let deleted = cur.read_u8()? != 0;
             let nlayers = cur.read_u8()? as usize;
             let mut neighbors = Vec::with_capacity(nlayers);
-            for _ in 0..nlayers {
-                let cnt = cur.read_u32()? as usize;
-                let mut lvec = Vec::with_capacity(cnt);
-                for _ in 0..cnt {
-                    lvec.push(cur.read_u32()?);
+            if compact_nbs {
+                for _ in 0..nlayers {
+                    let cnt = cur.read_u8()? as usize;
+                    let mut lvec = Vec::with_capacity(cnt);
+                    for _ in 0..cnt {
+                        lvec.push(Neighbor::uninit(cur.read_u16()? as u32));
+                    }
+                    neighbors.push(lvec);
                 }
-                neighbors.push(lvec);
+            } else {
+                for _ in 0..nlayers {
+                    let cnt = cur.read_u32()? as usize;
+                    let mut lvec = Vec::with_capacity(cnt);
+                    for _ in 0..cnt {
+                        lvec.push(Neighbor::uninit(cur.read_u32()?));
+                    }
+                    neighbors.push(lvec);
+                }
             }
             if !deleted {
                 row_to_node.insert(row_id, nid as u32);
@@ -813,15 +1270,22 @@ impl HnswIndex {
 
         let mut vectors = VectorStore::new(dim, spill_path.clone());
         let vec_len = cur.read_u64()? as usize;
-        if !spilled {
+        let mut needs_table_vectors = false;
+        if storage_mode == 0 {
             let raw = cur.read_bytes(vec_len * 4)?;
             let mut in_mem = Vec::with_capacity(vec_len);
+            let mut safe_f32 = true;
             for chunk in raw.chunks_exact(4) {
-                in_mem.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if safe_f32 && val.abs() >= 1e15 {
+                    safe_f32 = false;
+                }
+                in_mem.push(val);
             }
             vectors.in_mem = in_mem;
             vectors.spilled = false;
-        } else {
+            vectors.safe_for_f32_dist = safe_f32;
+        } else if storage_mode == 1 {
             if !spill_path.exists() {
                 return Ok(None);
             }
@@ -831,6 +1295,11 @@ impl HnswIndex {
             }
             vectors.spill_file = Some(file);
             vectors.spilled = true;
+        } else if storage_mode == 2 {
+            needs_table_vectors = true;
+            vectors.spilled = false;
+        } else {
+            return Ok(None);
         }
 
         Ok(Some(Self {
@@ -839,7 +1308,7 @@ impl HnswIndex {
             m,
             m0,
             ef_construction,
-            ef_search: 256,
+            ef_search: 128,
             m_l: 1.0 / (m as f64).ln(),
             nodes,
             row_to_node,
@@ -849,6 +1318,54 @@ impl HnswIndex {
             vectors,
             visited: Vec::new(),
             visit_gen: 0,
+            dirty: false,
+            needs_table_vectors,
         }))
+    }
+
+    /// Populate `VectorStore::in_mem` from `DiskTable` when loaded from an external-vector (`spilled = 2`) snapshot.
+    pub fn populate_vectors_from_table(&mut self, dt: &DiskTable, col_idx: usize) -> Result<()> {
+        if !self.needs_table_vectors {
+            return Ok(());
+        }
+        let total_floats = self.nodes.len() * self.dim;
+        let mut in_mem = vec![0.0_f32; total_floats];
+        let mut safe_f32 = true;
+
+        if dt.cache_covers_all() {
+            for (nid, node) in self.nodes.iter().enumerate() {
+                if node.deleted {
+                    continue;
+                }
+                if let Some(row) = dt.cache.get(node.row_id) {
+                    if let Some(Value::Vector(vec)) = row.values.get(col_idx) {
+                        if safe_f32 && !is_slice_safe_for_f32(vec) {
+                            safe_f32 = false;
+                        }
+                        let start = nid * self.dim;
+                        in_mem[start..start + self.dim].copy_from_slice(vec);
+                    }
+                }
+            }
+        } else {
+            for (nid, node) in self.nodes.iter().enumerate() {
+                if node.deleted {
+                    continue;
+                }
+                if let Some(vec) = dt.read_vector_col(node.row_id, col_idx)? {
+                    if safe_f32 && !is_slice_safe_for_f32(&vec) {
+                        safe_f32 = false;
+                    }
+                    let start = nid * self.dim;
+                    in_mem[start..start + self.dim].copy_from_slice(&vec);
+                }
+            }
+        }
+
+        self.vectors.in_mem = in_mem;
+        self.vectors.safe_for_f32_dist = safe_f32;
+        self.needs_table_vectors = false;
+        self.dirty = false;
+        Ok(())
     }
 }
