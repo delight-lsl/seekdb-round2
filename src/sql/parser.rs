@@ -342,7 +342,23 @@ impl Parser {
         })
     }
 
+    /// Take the string literal at the cursor out of the token stream (no copy).
+    fn take_string_lit(&mut self) -> Option<String> {
+        if !matches!(self.peek(), Token::StringLit(_)) {
+            return None;
+        }
+        let idx = self.pos;
+        self.advance();
+        match std::mem::replace(&mut self.tokens[idx], Token::Comma) {
+            Token::StringLit(s) => Some(s),
+            _ => None,
+        }
+    }
+
     fn parse_literal(&mut self) -> Result<LiteralValue> {
+        if let Some(s) = self.take_string_lit() {
+            return Ok(LiteralValue::Str(s));
+        }
         match self.peek().clone() {
             Token::Ident(s) if s.eq_ignore_ascii_case("NULL") => {
                 self.advance();
@@ -629,6 +645,9 @@ impl Parser {
     }
 
     fn parse_query_vector(&mut self) -> Result<QueryVector> {
+        if let Some(s) = self.take_string_lit() {
+            return Ok(QueryVector::Text(s));
+        }
         match self.peek().clone() {
             Token::StringLit(s) => {
                 self.advance();

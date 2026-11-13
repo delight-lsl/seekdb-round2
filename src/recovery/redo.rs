@@ -1,34 +1,38 @@
 use crate::common::error::Result;
-use crate::common::types::{RowId, TableId, TxnId};
-use crate::recovery::checkpoint::{
-    build_hnsw_from_disk, hnsw_snap_path, hnsw_spill_path, perform_checkpoint,
-};
+use crate::common::types::TxnId;
 use crate::recovery::wal::{list_wal_segments, scan_wal_segment, WalFrameKind, WalManager};
-use crate::storage::codec::decode_row;
 use crate::storage::engine::StorageEngine;
 use crate::transaction::operation::WalOp;
-use crate::vector::index::HnswIndex;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 
-/// Idempotent Redo-only crash recovery executed on startup before emitting `ready`.
-pub fn recover_database(
-    data_dir: &Path,
-) -> Result<(StorageEngine, WalManager, HashMap<(TableId, usize), HnswIndex>)> {
-    // Step 1 & 2: Load checkpoint.meta, truncate .dat files to safe lengths, rebuild PK & RowId maps
-    let (mut storage, ckp_opt) = StorageEngine::open_from_checkpoint(data_dir)?;
+/// Idempotent crash recovery executed on startup before emitting `ready`.
+///
+/// 1. Load `checkpoint.meta` (table schemas, generations, checkpointed file lengths).
+/// 2. Scan the WAL after the checkpoint, cutting off a torn tail; collect the committed
+///    transaction ids and their schema operations.
+/// 3. Open every table file and rebuild its in-memory state from the complete groups:
+///    self-committed groups always count, WAL-coordinated groups count only if they are
+///    covered by the checkpoint or their transaction has a WAL commit record. The first
+///    group that does not count (and anything after it) is truncated.
+/// 4. Remove table files that belong to no committed table.
+///
+/// Nothing here depends on a previous recovery attempt having finished, so being killed
+/// half-way and starting over yields the same state.
+pub fn recover_database(data_dir: &Path) -> Result<(StorageEngine, WalManager)> {
+    let (mut storage, ckp_opt) = StorageEngine::open_dirs(data_dir)?;
     let (start_wal_seq, start_wal_offset, ckp_next_txn_id) = match &ckp_opt {
         Some(ckp) => (ckp.wal_seq.max(1), ckp.wal_offset, ckp.next_txn_id.max(1)),
         None => (1, 0, 1),
     };
 
-    // Step 3: Scan WAL segments from checkpoint point onward, truncating any torn tail
     let wal_dir = data_dir.join("wal");
     let segments = list_wal_segments(&wal_dir)?;
 
     let mut txn_ops: HashMap<TxnId, Vec<WalOp>> = HashMap::new();
     let mut committed_order: Vec<TxnId> = Vec::new();
-    let mut committed_set: HashSet<TxnId> = HashSet::new();
+    let mut committed: HashSet<TxnId> = HashSet::new();
     let mut max_seen_txn_id = 0_u64;
     let mut active_wal_seq = start_wal_seq;
     let mut active_wal_offset = start_wal_offset;
@@ -53,7 +57,7 @@ pub fn recover_database(
                     txn_ops.entry(frame.txn_id).or_default().push(op);
                 }
                 WalFrameKind::Commit => {
-                    if committed_set.insert(frame.txn_id) {
+                    if committed.insert(frame.txn_id) {
                         committed_order.push(frame.txn_id);
                     }
                 }
@@ -63,127 +67,66 @@ pub fn recover_database(
         active_wal_offset = scan.valid_end_offset;
     }
 
-    // Step 4: Replay ONLY committed transactions in commit order
-    let mut replayed_any = false;
-    let mut touched_tables: HashSet<TableId> = HashSet::new();
+    // Tables known to the checkpoint.
+    if let Some(ckp) = &ckp_opt {
+        storage.catalog.bump_next_table_id(ckp.next_table_id);
+        for snap in &ckp.tables {
+            storage.attach_table(
+                snap.schema.clone(),
+                snap.generation,
+                snap.next_row_id,
+                snap.safe_data_len,
+                &committed,
+            )?;
+        }
+    }
 
+    // Schema operations committed after the checkpoint, in commit order.
     for txn_id in &committed_order {
         let Some(ops) = txn_ops.remove(txn_id) else {
             continue;
         };
-        replayed_any = true;
-        // Group consecutive table DML ops per table for batched apply
-        let mut pending_puts: HashMap<TableId, Vec<(RowId, Option<i64>, crate::common::types::Row)>> =
-            HashMap::new();
-        let mut pending_deletes: HashMap<TableId, Vec<(RowId, Option<i64>)>> = HashMap::new();
-
         for op in ops {
             match op {
                 WalOp::CreateTable(schema) => {
-                    let tid = schema.table_id;
-                    storage.create_table(schema)?;
-                    touched_tables.insert(tid);
+                    if storage.tables.contains_key(&schema.table_id) {
+                        continue;
+                    }
+                    storage.attach_table(schema, 1, 1, 0, &committed)?;
                 }
                 WalOp::CreateIndex { table_id, index } => {
-                    storage
+                    if storage
                         .catalog
-                        .add_vector_index(table_id, index.clone())?;
-                    storage
-                        .get_table_mut(table_id)?
-                        .schema
-                        .indexes
-                        .push(index);
-                    touched_tables.insert(table_id);
-                }
-                WalOp::PutRow {
-                    table_id,
-                    row_id,
-                    old_pk,
-                    row_bytes,
-                } => {
-                    let schema = &storage.get_table(table_id)?.schema;
-                    let row = decode_row(&row_bytes, schema)?;
-                    pending_puts
-                        .entry(table_id)
-                        .or_default()
-                        .push((row_id, old_pk, row));
-                    touched_tables.insert(table_id);
-                }
-                WalOp::DeleteRow {
-                    table_id,
-                    row_id,
-                    old_pk,
-                } => {
-                    pending_deletes
-                        .entry(table_id)
-                        .or_default()
-                        .push((row_id, old_pk));
-                    touched_tables.insert(table_id);
-                }
-            }
-        }
-
-        for tid in pending_puts.keys().chain(pending_deletes.keys()).copied().collect::<HashSet<_>>() {
-            let puts = pending_puts.remove(&tid).unwrap_or_default();
-            let dels = pending_deletes.remove(&tid).unwrap_or_default();
-            let dt = storage.get_table_mut(tid)?;
-            dt.apply_batch(&puts, &dels, false)?;
-        }
-    }
-
-    for &tid in &touched_tables {
-        if let Ok(dt) = storage.get_table(tid) {
-            dt.file.sync_all()?;
-        }
-    }
-
-    // Step 5: Open WalManager at latest valid WAL end
-    let next_txn_id = ckp_next_txn_id.max(max_seen_txn_id + 1);
-    let mut wal = WalManager::open(wal_dir, active_wal_seq, active_wal_offset, next_txn_id)?;
-
-    // Step 6: Load HNSW snapshots for untouched tables, or rebuild cleanly for touched/missing tables
-    let mut hnsw_indexes: HashMap<(TableId, usize), HnswIndex> = HashMap::new();
-    let mut to_rebuild = Vec::new();
-    for (&tid, dt) in &storage.tables {
-        for idx_schema in &dt.schema.indexes {
-            if !touched_tables.contains(&tid) {
-                let snap_path =
-                    hnsw_snap_path(data_dir, tid, idx_schema.col_idx, dt.generation);
-                let spill_path =
-                    hnsw_spill_path(data_dir, tid, idx_schema.col_idx, dt.generation);
-                if let Some(mut loaded) =
-                    HnswIndex::load_snapshot(idx_schema.name.clone(), &snap_path, spill_path)?
-                {
-                    if loaded.live_count() == dt.live_count() && loaded.dim == idx_schema.dim {
-                        if loaded.needs_table_vectors() {
-                            loaded.populate_vectors_from_table(dt, idx_schema.col_idx)?;
-                        }
-                        hnsw_indexes.insert((tid, idx_schema.col_idx), loaded);
-                        continue;
+                        .add_vector_index(table_id, index.clone())
+                        .is_ok()
+                    {
+                        storage.get_table_mut(table_id)?.schema.indexes.push(index);
                     }
                 }
             }
-            to_rebuild.push((tid, idx_schema.clone()));
         }
     }
-    for (tid, idx_schema) in to_rebuild {
-        let dt = storage.get_table(tid)?;
-        let hnsw = build_hnsw_from_disk(
-            data_dir,
-            dt,
-            idx_schema.col_idx,
-            idx_schema.dim,
-            &idx_schema.name,
-        )?;
-        hnsw_indexes.insert((tid, idx_schema.col_idx), hnsw);
-    }
 
-    // Step 7: Persist clean checkpoint if WAL Redo replayed any transactions
-    if replayed_any {
-        perform_checkpoint(&mut storage, &mut wal, &mut hnsw_indexes, false)?;
-    } else {
-        wal.delete_segments_before(start_wal_seq)?;
+    // Drop table files that no committed table owns (aborted DDL, superseded generations).
+    let expected: HashSet<String> = storage
+        .tables
+        .values()
+        .filter_map(|dt| dt.file.path.file_name().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    if let Ok(entries) = fs::read_dir(data_dir.join("tables")) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if !expected.contains(name) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
+    storage.enforce_memory_budget()?;
 
-    Ok((storage, wal, hnsw_indexes))
+    let next_txn_id = ckp_next_txn_id.max(max_seen_txn_id + 1);
+    let wal = WalManager::open(wal_dir, active_wal_seq, active_wal_offset, next_txn_id)?;
+    wal.delete_segments_before(start_wal_seq)?;
+
+    Ok((storage, wal))
 }

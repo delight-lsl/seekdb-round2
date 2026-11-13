@@ -32,6 +32,74 @@ pub fn write_f32(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Append a whole `f32` slice in little-endian byte order with a single copy.
+#[inline]
+pub fn write_f32_slice(buf: &mut Vec<u8>, v: &[f32]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: f32 has no padding and any bit pattern is a valid u8 sequence.
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        buf.extend_from_slice(bytes);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in v {
+            write_f32(buf, x);
+        }
+    }
+}
+
+/// Decode little-endian bytes (length must be a multiple of 4) into `f32` values.
+#[inline]
+pub fn read_f32_vec(raw: &[u8]) -> Vec<f32> {
+    let n = raw.len() / 4;
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `out` has capacity for `n` f32 values and every bit pattern is a valid f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4);
+            out.set_len(n);
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for chunk in raw.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    out
+}
+
+/// Copy the raw little-endian vector bytes of column `col_idx` into `dst` (length `dim`).
+/// Returns `Ok(false)` when the stored value is NULL.
+pub fn copy_vector_from_row_bytes(bytes: &[u8], col_idx: usize, dst: &mut [f32]) -> Result<bool> {
+    let mut cur = Cursor::new(bytes);
+    let col_count = cur.read_u16()? as usize;
+    if col_idx >= col_count {
+        return Err(DbError::new(ErrorCode::IoError, "vector col_idx out of bounds"));
+    }
+    for _ in 0..col_idx {
+        skip_value(&mut cur)?;
+    }
+    let tag = cur.read_u8()?;
+    match tag {
+        TAG_NULL => Ok(false),
+        TAG_VECTOR => {
+            let dim = cur.read_u32()? as usize;
+            if dim != dst.len() {
+                return Err(DbError::new(ErrorCode::IoError, "stored vector dimension mismatch"));
+            }
+            let raw = cur.read_bytes(dim * 4)?;
+            for (d, chunk) in dst.iter_mut().zip(raw.chunks_exact(4)) {
+                *d = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            Ok(true)
+        }
+        _ => Err(DbError::new(ErrorCode::IoError, "expected vector value in record")),
+    }
+}
+
 pub fn write_str(buf: &mut Vec<u8>, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     let len = u32::try_from(bytes.len())
@@ -147,9 +215,7 @@ pub fn encode_row(row: &Row, buf: &mut Vec<u8>) -> Result<()> {
                     DbError::new(ErrorCode::InvalidVector, "vector dimension exceeds u32")
                 })?;
                 write_u32(buf, dim);
-                for &x in vec {
-                    write_f32(buf, x);
-                }
+                write_f32_slice(buf, vec);
             }
         }
     }
@@ -244,12 +310,7 @@ fn read_value(cur: &mut Cursor<'_>) -> Result<Value> {
         TAG_VECTOR => {
             let dim = cur.read_u32()? as usize;
             let raw = cur.read_bytes(dim * 4)?;
-            let mut vec = Vec::with_capacity(dim);
-            for chunk in raw.chunks_exact(4) {
-                let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                vec.push(f);
-            }
-            Ok(Value::Vector(vec))
+            Ok(Value::Vector(read_f32_vec(raw)))
         }
         other => Err(DbError::new(
             ErrorCode::IoError,
@@ -375,4 +436,51 @@ pub fn decode_schema(cur: &mut Cursor<'_>) -> Result<TableSchema> {
         pk_col_idx,
         indexes,
     })
+}
+
+/// Borrowed raw column value inside an encoded row.
+pub enum RawVal<'a> {
+    Null,
+    Int(i64),
+    Str(&'a [u8]),
+    /// Little-endian `f32` bytes.
+    Vector(&'a [u8]),
+}
+
+/// Walk an encoded row, handing each column to `f` without allocating.
+pub fn for_each_raw_value<'a, F>(bytes: &'a [u8], expected_cols: usize, mut f: F) -> Result<()>
+where
+    F: FnMut(usize, RawVal<'a>) -> Result<()>,
+{
+    let mut cur = Cursor::new(bytes);
+    let col_count = cur.read_u16()? as usize;
+    if col_count != expected_cols {
+        return Err(DbError::new(
+            ErrorCode::IoError,
+            format!("stored row column count {} != schema {}", col_count, expected_cols),
+        ));
+    }
+    for idx in 0..col_count {
+        let tag = cur.read_u8()?;
+        let raw = match tag {
+            TAG_NULL => RawVal::Null,
+            TAG_BIGINT => RawVal::Int(cur.read_i64()?),
+            TAG_VARCHAR => {
+                let len = cur.read_u32()? as usize;
+                RawVal::Str(cur.read_bytes(len)?)
+            }
+            TAG_VECTOR => {
+                let dim = cur.read_u32()? as usize;
+                RawVal::Vector(cur.read_bytes(dim * 4)?)
+            }
+            other => {
+                return Err(DbError::new(
+                    ErrorCode::IoError,
+                    format!("unknown encoded value tag {}", other),
+                ));
+            }
+        };
+        f(idx, raw)?;
+    }
+    Ok(())
 }

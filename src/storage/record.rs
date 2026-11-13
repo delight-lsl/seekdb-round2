@@ -11,6 +11,10 @@ pub const DATA_TRAILER_LEN: usize = 4; // 4 (crc32)
 pub enum DataRecordOp {
     Put = 1,
     Tombstone = 2,
+    /// Group terminator: every frame since the previous terminator is committed.
+    Commit = 3,
+    /// Group terminator of a WAL-coordinated transaction (`row_id` field carries the txn id).
+    Pending = 4,
 }
 
 impl DataRecordOp {
@@ -18,6 +22,8 @@ impl DataRecordOp {
         match v {
             1 => Ok(Self::Put),
             2 => Ok(Self::Tombstone),
+            3 => Ok(Self::Commit),
+            4 => Ok(Self::Pending),
             _ => Err(DbError::new(
                 ErrorCode::IoError,
                 format!("invalid data record op {}", v),
@@ -141,4 +147,28 @@ pub fn read_next_data_frame<R: Read>(reader: &mut R, offset: u64) -> Result<Opti
         frame_offset: offset,
         frame_len: total_len,
     }))
+}
+
+/// Begin a data frame in place inside `out`; returns the frame start offset.
+/// The caller appends the payload directly and then calls `finish_data_frame`.
+#[inline]
+pub fn begin_data_frame(op: DataRecordOp, row_id: RowId, out: &mut Vec<u8>) -> usize {
+    let start = out.len();
+    out.extend_from_slice(&DATA_FRAME_MAGIC);
+    out.push(op as u8);
+    out.extend_from_slice(&row_id.to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]);
+    start
+}
+
+/// Patch the payload length, append the CRC and return the total frame length.
+#[inline]
+pub fn finish_data_frame(start: usize, out: &mut Vec<u8>) -> Result<u32> {
+    let payload_len = u32::try_from(out.len() - start - DATA_HEADER_LEN)
+        .map_err(|_| DbError::new(ErrorCode::InternalError, "record payload exceeds u32"))?;
+    out[start + 13..start + 17].copy_from_slice(&payload_len.to_le_bytes());
+    let crc = crc32fast::hash(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    u32::try_from(out.len() - start)
+        .map_err(|_| DbError::new(ErrorCode::InternalError, "frame len exceeds u32"))
 }

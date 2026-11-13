@@ -20,23 +20,12 @@ pub struct TxnWriteSet {
     pub table_writes: HashMap<TableId, TableTxnWriteSet>,
 }
 
-/// Redo-log operation emitted on commit (both explicit and implicit transactions).
+/// Schema operation recorded in the WAL at commit time.
 #[derive(Debug, Clone)]
 pub enum WalOp {
     CreateTable(TableSchema),
     CreateIndex {
         table_id: TableId,
         index: VectorIndexSchema,
-    },
-    PutRow {
-        table_id: TableId,
-        row_id: RowId,
-        old_pk: Option<i64>,
-        row_bytes: Vec<u8>,
-    },
-    DeleteRow {
-        table_id: TableId,
-        row_id: RowId,
-        old_pk: Option<i64>,
     },
 }

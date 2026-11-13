@@ -1,6 +1,5 @@
 use crate::common::error::{DbError, ErrorCode, Result};
-use crate::storage::codec::encode_row;
-use crate::transaction::operation::{TxnWriteSet, WalOp};
+use crate::transaction::operation::TxnWriteSet;
 
 /// Single-client transaction lifecycle manager.
 #[derive(Debug, Default)]
@@ -49,38 +48,5 @@ impl TransactionManager {
 
     pub fn discard_if_active(&mut self) {
         self.active = None;
-    }
-
-    pub fn build_wal_ops(txn: &TxnWriteSet) -> Result<Vec<WalOp>> {
-        let mut ops = Vec::new();
-        for schema in &txn.created_tables {
-            ops.push(WalOp::CreateTable(schema.clone()));
-        }
-        for (tid, idx) in &txn.created_indexes {
-            ops.push(WalOp::CreateIndex {
-                table_id: *tid,
-                index: idx.clone(),
-            });
-        }
-        for (&tid, tws) in &txn.table_writes {
-            for (&rid, (old_pk, row)) in &tws.puts {
-                let mut row_bytes = Vec::new();
-                encode_row(row, &mut row_bytes)?;
-                ops.push(WalOp::PutRow {
-                    table_id: tid,
-                    row_id: rid,
-                    old_pk: *old_pk,
-                    row_bytes,
-                });
-            }
-            for (&rid, &old_pk) in &tws.deletes {
-                ops.push(WalOp::DeleteRow {
-                    table_id: tid,
-                    row_id: rid,
-                    old_pk,
-                });
-            }
-        }
-        Ok(ops)
     }
 }

@@ -14,13 +14,15 @@ COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --offline
+# Statically linked binary: no dynamic loader / shared libc pages at run time.
+# (--target keeps the flag away from build scripts and proc-macros.)
+RUN RUSTFLAGS="-C target-feature=+crt-static"     cargo build --release --locked --offline --bin minivectordb --target x86_64-unknown-linux-gnu &&     cp target/x86_64-unknown-linux-gnu/release/minivectordb /build/minivectordb
 
 # Runtime stage matching section 4.2.1 (Ubuntu 24.04)
 FROM ubuntu:24.04
 
 WORKDIR /app
-COPY --from=builder /build/target/release/minivectordb /app/minivectordb
+COPY --from=builder /build/minivectordb /app/minivectordb
 RUN chmod 755 /app/minivectordb && \
     ln -s /app/minivectordb /usr/local/bin/minivectordb && \
     mkdir -p /data && chmod 1777 /data

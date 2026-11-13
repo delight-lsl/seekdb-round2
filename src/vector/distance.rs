@@ -230,3 +230,232 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> Result<f64> {
 pub fn l2_distance(a: &[f32], b: &[f32]) -> Result<f64> {
     Ok(l2_distance_squared(a, b)?.sqrt())
 }
+
+/// Single-precision candidate scan over contiguous vector blocks.
+///
+/// Returns the slots of every row whose f32 squared distance is within the rounding
+/// slack of the k-th smallest one, i.e. a superset of the exact top-k (ties included).
+/// The caller re-ranks this small set with the exact kernel.
+/// Callers guarantee all components are below 1e15 in magnitude (no f32 overflow).
+pub fn scan_topk_f32<'a, I>(blocks: I, dim: usize, query: &[f32], k: usize, mask: Option<&[u8]>) -> Vec<u32>
+where
+    I: Iterator<Item = (usize, usize, &'a [f32])>,
+{
+    use std::collections::BinaryHeap;
+    debug_assert_eq!(query.len(), dim);
+    #[cfg(target_arch = "x86_64")]
+    let simd = dim >= 8 && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
+
+    // Non-negative finite f32 values order exactly like their bit patterns.
+    let mut heap: BinaryHeap<u32> = BinaryHeap::with_capacity(k.min(4096) + 1);
+    let mut cands: Vec<(f32, u32)> = Vec::with_capacity(k.min(4096) * 4 + 16);
+    let mut thr = f32::INFINITY;
+    // Worst-case relative rounding error of the f32 kernel is below (dim/8 + 32) ulps;
+    // three times that covers "f32 value vs exact value" on both sides of the comparison.
+    let slack = 1.0 + 3.0 * (dim as f32 / 8.0 + 32.0) * f32::EPSILON;
+
+    for (first_slot, rows, data) in blocks {
+        for r in 0..rows {
+            let slot = first_slot + r;
+            if let Some(m) = mask {
+                if m[slot] == 0 {
+                    continue;
+                }
+            }
+            let v = &data[r * dim..(r + 1) * dim];
+            let d = if simd {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // SAFETY: AVX2/FMA availability was checked above; slices have `dim` elements.
+                    unsafe { l2_sq_f32_avx2_fma(v, query) }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    l2_sq_f32_unrolled(v, query)
+                }
+            } else {
+                l2_sq_f32_unrolled(v, query)
+            };
+            if d <= thr {
+                cands.push((d, slot as u32));
+                if heap.len() < k {
+                    heap.push(d.to_bits());
+                    if heap.len() == k {
+                        thr = f32::from_bits(*heap.peek().unwrap()) * slack + f32::MIN_POSITIVE;
+                    }
+                } else if d.to_bits() < *heap.peek().unwrap() {
+                    *heap.peek_mut().unwrap() = d.to_bits();
+                    thr = f32::from_bits(*heap.peek().unwrap()) * slack + f32::MIN_POSITIVE;
+                }
+                if cands.len() >= 8192 && cands.len() >= k.saturating_mul(8) {
+                    cands.retain(|c| c.0 <= thr);
+                }
+            }
+        }
+    }
+    cands.into_iter().filter(|c| c.0 <= thr).map(|c| c.1).collect()
+}
+
+/// Integer lower bounds for one block of 7-bit codes (`rows` rows of `stride` bytes,
+/// `stride` a multiple of 32): for every selected row, `sum(max(0, |c - q| - 1)^2)` is
+/// appended to `lbs`. With a mask, the slot number of each selected row is appended to
+/// `slots` as well (without a mask the position in `lbs` is the slot).
+pub fn sq_lower_bounds(
+    codes: &[u8],
+    stride: usize,
+    rows: usize,
+    q: &[u8],
+    mask: Option<&[u8]>,
+    first_slot: u32,
+    lbs: &mut Vec<u32>,
+    slots: &mut Vec<u32>,
+) {
+    assert!(stride % 32 == 0 && q.len() == stride && codes.len() >= rows * stride);
+    if let Some(m) = mask {
+        assert!(m.len() >= rows);
+    }
+    lbs.reserve(rows);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 availability checked; bounds asserted above; capacity reserved.
+            unsafe { sq_lower_bounds_avx2(codes, stride, rows, q, mask, first_slot, lbs, slots) };
+            return;
+        }
+    }
+    for r in 0..rows {
+        if let Some(m) = mask {
+            if m[r] == 0 {
+                continue;
+            }
+            slots.push(first_slot + r as u32);
+        }
+        let row = &codes[r * stride..(r + 1) * stride];
+        let mut lb = 0u32;
+        for (a, b) in row.iter().zip(q.iter()) {
+            let d = (*a as i32 - *b as i32).unsigned_abs().saturating_sub(1);
+            lb += d * d;
+        }
+        lbs.push(lb);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sq_lower_bounds_avx2(
+    codes: &[u8],
+    stride: usize,
+    rows: usize,
+    q: &[u8],
+    mask: Option<&[u8]>,
+    first_slot: u32,
+    lbs: &mut Vec<u32>,
+    slots: &mut Vec<u32>,
+) {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_epi8(1);
+    let ones16 = _mm256_set1_epi16(1);
+    let qp = q.as_ptr();
+    let base = codes.as_ptr();
+    let words = stride / 32;
+
+    #[inline(always)]
+    unsafe fn row_lb(rp: *const u8, qp: *const u8, words: usize, one: __m256i, ones16: __m256i) -> u32 {
+        let mut acc = _mm256_setzero_si256();
+        for w in 0..words {
+            let x = _mm256_loadu_si256(rp.add(w * 32) as *const __m256i);
+            let y = _mm256_loadu_si256(qp.add(w * 32) as *const __m256i);
+            // |x - y| - 1 saturated at 0; codes are 7-bit, so the value fits a signed byte
+            // and each maddubs pair (<= 2 * 126^2) fits a signed 16-bit lane.
+            let d = _mm256_subs_epu8(_mm256_or_si256(_mm256_subs_epu8(x, y), _mm256_subs_epu8(y, x)), one);
+            let sq16 = _mm256_maddubs_epi16(d, d);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(sq16, ones16));
+        }
+        let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x11));
+        _mm_cvtsi128_si32(s) as u32
+    }
+
+    match mask {
+        None => {
+            let out = lbs.as_mut_ptr().add(lbs.len());
+            for r in 0..rows {
+                *out.add(r) = row_lb(base.add(r * stride), qp, words, one, ones16);
+            }
+            lbs.set_len(lbs.len() + rows);
+        }
+        Some(m) => {
+            let zero = _mm256_setzero_si256();
+            let mp = m.as_ptr();
+            let mut r0 = 0usize;
+            while r0 < rows {
+                // Bitmap of selected rows among the next (up to) 32.
+                let mut bits: u32 = if r0 + 32 <= rows {
+                    !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(mp.add(r0) as *const __m256i), zero)) as u32)
+                } else {
+                    let mut b = 0u32;
+                    for j in 0..rows - r0 {
+                        b |= ((*mp.add(r0 + j) != 0) as u32) << j;
+                    }
+                    b
+                };
+                while bits != 0 {
+                    let r = r0 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    lbs.push(row_lb(base.add(r * stride), qp, words, one, ones16));
+                    slots.push(first_slot + r as u32);
+                }
+                r0 += 32;
+            }
+        }
+    }
+}
+
+/// Visit every index `i` with `vals[i] <= thr`, in increasing order. The callback
+/// returns the threshold to use from then on (it may only stay or shrink); indexes
+/// reported right after a change may exceed the new threshold by a few positions, so
+/// the callback re-checks when it matters. All values must be below `2^31`.
+pub fn scan_le<F>(vals: &[u32], thr: u32, mut f: F)
+where
+    F: FnMut(usize) -> u32,
+{
+    let mut thr = thr.min(i32::MAX as u32);
+    let mut i = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 availability checked; loads stay inside `vals`.
+            unsafe {
+                use std::arch::x86_64::*;
+                let p = vals.as_ptr();
+                let mut tv = _mm256_set1_epi32(thr as i32);
+                while i + 8 <= vals.len() {
+                    let v = _mm256_loadu_si256(p.add(i) as *const __m256i);
+                    let gt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, tv))) as u32;
+                    let mut hit = !gt & 0xff;
+                    if hit != 0 {
+                        while hit != 0 {
+                            let j = hit.trailing_zeros() as usize;
+                            hit &= hit - 1;
+                            if *p.add(i + j) <= thr {
+                                thr = f(i + j).min(thr);
+                            }
+                        }
+                        tv = _mm256_set1_epi32(thr as i32);
+                    }
+                    i += 8;
+                }
+            }
+        }
+    }
+    while i < vals.len() {
+        if vals[i] <= thr {
+            thr = f(i).min(thr);
+        }
+        i += 1;
+    }
+}

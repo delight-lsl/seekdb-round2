@@ -39,6 +39,17 @@ impl Catalog {
         self.next_table_id
     }
 
+    pub fn bump_next_table_id(&mut self, at_least: TableId) {
+        self.next_table_id = self.next_table_id.max(at_least).max(1);
+    }
+
+    /// Forget a table that never reached its commit point.
+    pub fn remove_table(&mut self, table_id: TableId) {
+        if let Some(key) = self.id_to_name.remove(&table_id) {
+            self.tables.remove(&key);
+        }
+    }
+
     pub fn all_tables(&self) -> impl Iterator<Item = &TableSchema> {
         self.tables.values()
     }

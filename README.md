@@ -1,6 +1,6 @@
 # MiniVectorDB
 
-从零使用 Rust 实现的轻量级单机向量数据库系统，支持自研 SQL 词法/语法解析、Append-only 持久化存储、AVX2/FMA 加速 L2 距离与 `BinaryHeap` 精确 TopK 检索、有界内存 HNSW 近似向量索引、单事务写集与分段 WAL 崩溃恢复，并通过 JSONL `stdin`/`stdout` 协议在 Docker 容器前台运行。
+从零使用 Rust 实现的轻量级单机向量数据库系统，支持自研 SQL 词法/语法解析、Append-only 提交日志式持久化存储（行数据只落盘一次）、列式内存镜像、AVX2 标量量化下界扫描 + 双精度精排的精确 TopK 检索、单事务写集与崩溃恢复，并通过 JSONL `stdin`/`stdout` 协议在 Docker 容器前台运行。
 
 ---
 
@@ -53,9 +53,9 @@ docker run --rm -i \
 ```
 
 - **JSONL STDIO 协议**：
-  1. 启动后先对 `/data` 执行崩溃恢复与检查点加载，随后主动向 `stdout` 输出 `{"type":"ready"}\n` 并立即 `flush()`。
+  1. 启动后先对 `/data` 执行崩溃恢复并把表装载进内存镜像，随后主动向 `stdout` 输出 `{"type":"ready"}\n` 并立即 `flush()`。
   2. 从 `stdin` 逐行读取 JSON 请求，逐行返回包含相同 `id` 与布尔值 `ok` 的 JSON 响应并 `flush()`。
-  3. 收到 `{"id":...,"op":"shutdown"}` 时，回滚未提交事务、刷新检查点与索引快照，返回 `{"id":...,"ok":true}\n` 后以退出码 `0` 退出，不再向 `stdout` 输出任何内容。
+  3. 收到 `{"id":...,"op":"shutdown"}` 时，回滚未提交事务（已应答的提交此前均已落盘），返回 `{"id":...,"ok":true}\n` 后以退出码 `0` 退出，不再向 `stdout` 输出任何内容。
   4. 所有启动与诊断日志均写入 `stderr`，绝不污染 `stdout`。
 
 ---
@@ -66,17 +66,15 @@ docker run --rm -i \
 
 ```text
 /data/
-├── checkpoint.meta                  # 原子替换的检查点元数据（表结构、安全截断长度、WAL 起点、CRC32）
+├── checkpoint.meta                  # 原子替换的检查点元数据（表结构、代际、检查点文件长度、WAL 起点、CRC32）
 ├── wal/
-│   └── wal_00000001.log             # 分段式 Write-Ahead Log（CRC32 校验）
+│   └── wal_00000001.log             # DDL 与跨文件事务的提交记录（不含行数据，CRC32 校验）
 ├── tables/
-│   ├── t_<tid>_g<gen>.dat           # Append-only 表数据文件（Put / Tombstone 帧）
-│   ├── idx_<tid>_<col>_g<gen>.hnsw  # 持久化的 HNSW 图索引快照
-│   └── idx_<tid>_<col>_g<gen>.vec   # 超出 512 MiB 内存限额时的磁盘向量溢写文件
+│   └── t_<tid>_g<gen>.dat           # 表数据文件（Put / Tombstone 行帧 + 事务组结束符帧）
 └── tmp/                             # 临时原子替换目录（启动时自动清理）
 ```
 
-重启或崩溃恢复时复用原 `/data` 目录，不清空既有数据；已提交事务通过 WAL Redo 恢复，未提交或无有效 `COMMIT` 帧的事务在恢复及截断尾部残缺帧时被彻底丢弃。
+重启或崩溃恢复时复用原 `/data` 目录，不清空既有数据；每个事务在表文件中是一个以结束符帧收尾的组，恢复时只保留完整且已提交的组，残缺或未提交的尾部被截断丢弃。
 
 ---
 
@@ -93,7 +91,7 @@ docker run --rm -i \
 - **查询能力**：
   - `WHERE` 支持 `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN (...)` 与括号组合
   - `L2_DISTANCE(vec_col, query_vec)` 返回欧氏距离（内部存储为 `f32`，`f64` 累加防平方溢出；`ORDER BY` 使用平方距离排序且支持别名引用，并列按主键升序排列）
-  - `search_mode = "exact"` 使用 `BinaryHeap` 精确 TopK（先过滤后截取）；`search_mode = "ann"` 在存在向量索引时使用 HNSW 图检索（支持过滤与回退）
+  - `search_mode = "exact"` 与 `"ann"` 均返回精确 TopK（先过滤后截取，距离并列按主键升序）：大表用 7-bit 标量量化下界码筛选候选再双精度精排，小表用单精度 SIMD 预筛 + 双精度精排
 - **明确不支持并报错（`unsupported_sql`）**：`ALTER TABLE`、`DROP`、`TRUNCATE`、`JOIN`、`GROUP BY`、`HAVING`、`DISTINCT`、`OFFSET`、`CREATE INDEX`（非 `VECTOR`）等。
 
 ---
@@ -143,7 +141,7 @@ JSONL
 - `{"id":3,"ok":true,"affected_rows":3}`（写入 3 行）
 - `{"id":4,"ok":true,"columns":["id","content"],"rows":[[1,"初始甲"],[3,"初始丙"]]}`（普通查询）
 - `{"id":5,"ok":true,"columns":["id","distance"],"rows":[[1,0.0],[3,5.0]]}`（`exact` 过滤 + 向量 TopK）
-- `{"id":6,"ok":true,"columns":["id","distance"],"rows":[[1,0.0],[3,5.0]]}`（`ann` HNSW 检索）
+- `{"id":6,"ok":true,"columns":["id","distance"],"rows":[[1,0.0],[3,5.0]]}`（`ann` 模式，同样返回精确结果）
 - `{"id":7,"ok":true}`、`{"id":8,"ok":true,"affected_rows":1}`、`{"id":9,"ok":true}`（提交事务生效）
 - `{"id":10,"ok":true}`、`{"id":11,"ok":true,"affected_rows":1}`、`{"id":12,"ok":true}`（回滚事务撤销删除）
 - `{"id":13,"ok":true}`（正常关闭退出）
@@ -178,6 +176,6 @@ cargo run --release --example bench
 
 - [总体架构与复杂度分析](docs/ARCHITECTURE.md)
 - [简要设计与验证记录（第 4.3 节）](docs/DESIGN_AND_VERIFICATION.md)
-- [存储与 WAL / Checkpoint 二进制格式](docs/STORAGE_FORMAT.md)
+- [存储、WAL 与检查点二进制格式](docs/STORAGE_FORMAT.md)
 - [SQL 语法与 JSONL 通信协议](docs/SQL_SPEC.md)
 - [性能测试与优化记录](docs/BENCHMARK.md)

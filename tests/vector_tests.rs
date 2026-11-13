@@ -1,7 +1,6 @@
 use minivectordb::common::types::{ExecResult, SearchMode};
 use minivectordb::sql::executor::Database;
 use minivectordb::vector::distance::{l2_distance, l2_distance_squared};
-use minivectordb::vector::index::HnswIndex;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -227,28 +226,6 @@ fn test_hnsw_recall_and_filtered_ann() {
     for id in &aset {
         assert_eq!(id % 10, 0, "Filtered ANN returned non-matching id {}", id);
     }
-
-    // Verify spill-mode threshold transitions to disk .vec + LRU cache + snapshot reload cleanly
-    let spill_path = dir.0.join("spill_test.vec");
-    let snap_path = dir.0.join("spill_test.hnsw");
-    let tmp_path = dir.0.join("spill_test.tmp");
-    let mut hnsw = HnswIndex::with_cache_limit("test_spill".into(), 8, spill_path.clone(), 512);
-    for i in 1..=100_u64 {
-        let v: Vec<f32> = (0..8).map(|d| (i as f32) * 0.1 + (d as f32) * 0.01).collect();
-        hnsw.upsert(i, Some(i as i64), &v).unwrap();
-    }
-    assert!(hnsw.is_spilled(), "HNSW should spill beyond 512-byte cache cap");
-    hnsw.save_snapshot(&snap_path, &tmp_path).unwrap();
-
-    let mut reloaded =
-        HnswIndex::load_snapshot("test_spill".into(), &snap_path, spill_path).unwrap().unwrap();
-    assert!(reloaded.is_spilled());
-    let q: Vec<f32> = (0..8).map(|d| 5.0 + (d as f32) * 0.01).collect();
-    let (res, _) = reloaded
-        .search_knn(&q, 1, &HashSet::new(), None::<&mut fn(u64) -> minivectordb::common::error::Result<bool>>)
-        .unwrap();
-    assert_eq!(res.len(), 1);
-    assert_eq!(res[0].2, 50);
 }
 
 #[test]

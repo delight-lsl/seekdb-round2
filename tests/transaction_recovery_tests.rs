@@ -1,10 +1,10 @@
 use minivectordb::common::error::ErrorCode;
 use minivectordb::common::types::{ExecResult, SearchMode};
-use minivectordb::recovery::wal::{encode_wal_frame, encode_wal_op, wal_segment_path, KIND_BEGIN, KIND_PUT_ROW};
+use minivectordb::recovery::wal::{encode_wal_frame, wal_segment_path, KIND_BEGIN};
 use minivectordb::sql::executor::Database;
 use minivectordb::storage::codec::encode_row;
 use minivectordb::common::types::{Row, Value};
-use minivectordb::transaction::operation::WalOp;
+use minivectordb::storage::record::{begin_data_frame, finish_data_frame, DataRecordOp};
 use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -166,8 +166,8 @@ fn test_shutdown_rolls_back_uncommitted_transaction() {
 }
 
 #[test]
-fn test_fault_injection_crash_after_wal_commit_before_datafile_write() {
-    let dir = TempDir::new("fault_wal_ahead");
+fn test_fault_injection_uncommitted_and_torn_tails_are_discarded() {
+    let dir = TempDir::new("fault_tails");
     {
         let mut db = Database::open(&dir.0).unwrap();
         db.execute_sql(
@@ -175,105 +175,125 @@ fn test_fault_injection_crash_after_wal_commit_before_datafile_write() {
             SearchMode::Exact,
         )
         .unwrap();
-        db.execute_sql("INSERT INTO docs VALUES (1, 'ckpt');", SearchMode::Exact)
+        db.execute_sql("INSERT INTO docs VALUES (1, 'first');", SearchMode::Exact)
             .unwrap();
-        db.shutdown().unwrap(); // creates checkpoint with id=1
+        db.shutdown().unwrap();
     }
 
-    // Reopen, commit id=2 via WAL + data file, THEN simulate crash BEFORE data file flushed
-    // by writing a committed txn id=3 directly into WAL without touching data file, PLUS
-    // an uncommitted txn id=4 (no COMMIT), PLUS a corrupt partial WAL tail, PLUS corrupt .dat tail!
     {
         let mut db = Database::open(&dir.0).unwrap();
         db.execute_sql("INSERT INTO docs VALUES (2, 'normal');", SearchMode::Exact)
             .unwrap();
         let wal_seq = db.wal.current_seq;
         let dat_path = db.storage.get_table(1).unwrap().file.path.clone();
-        drop(db); // drop WITHOUT shutdown() (simulates SIGKILL!)
+        drop(db); // drop WITHOUT shutdown() (simulates SIGKILL)
 
-        // Inject WAL committed txn (id=3) that never reached .dat
+        let put_frame = |row_id: u64, id: i64, text: &str, out: &mut Vec<u8>| {
+            let start = begin_data_frame(DataRecordOp::Put, row_id, out);
+            encode_row(
+                &Row {
+                    values: vec![Value::BigInt(id), Value::Varchar(text.into())],
+                },
+                out,
+            )
+            .unwrap();
+            finish_data_frame(start, out).unwrap();
+        };
+
+        let mut buf = Vec::new();
+        // A group staged by a multi-table transaction (txn 99) whose commit record never
+        // reached the WAL: complete frames, complete terminator, still not committed.
+        put_frame(3, 3, "pending", &mut buf);
+        let start = begin_data_frame(DataRecordOp::Pending, 99, &mut buf);
+        finish_data_frame(start, &mut buf).unwrap();
+        // A self-committing group cut off before its terminator.
+        put_frame(4, 4, "no-term", &mut buf);
+        // Torn garbage at the very end.
+        buf.extend_from_slice(b"MVD1CORRUPT_TAIL_BYTES");
+        let mut dat_file = OpenOptions::new().append(true).open(&dat_path).unwrap();
+        dat_file.write_all(&buf).unwrap();
+        dat_file.sync_all().unwrap();
+
+        // A transaction in the WAL without a COMMIT frame, followed by a torn frame.
         let wal_path = wal_segment_path(&dir.0.join("wal"), wal_seq);
         let mut wal_file = OpenOptions::new().append(true).open(&wal_path).unwrap();
-        let mut row3_bytes = Vec::new();
-        encode_row(
-            &Row {
-                values: vec![Value::BigInt(3), Value::Varchar("redo".into())],
-            },
-            &mut row3_bytes,
-        )
-        .unwrap();
-        let mut buf = Vec::new();
-        encode_wal_frame(99, KIND_BEGIN, &[], &mut buf).unwrap();
-        let mut op_buf = Vec::new();
-        encode_wal_op(
-            &WalOp::PutRow {
-                table_id: 1,
-                row_id: 3,
-                old_pk: None,
-                row_bytes: row3_bytes,
-            },
-            &mut op_buf,
-        )
-        .unwrap();
-        encode_wal_frame(99, KIND_PUT_ROW, &op_buf, &mut buf).unwrap();
-        encode_wal_frame(99, 6 /* COMMIT */, &[], &mut buf).unwrap();
-
-        // Also inject uncommitted txn (id=4) WITHOUT Commit frame
-        encode_wal_frame(100, KIND_BEGIN, &[], &mut buf).unwrap();
-        let mut row4_bytes = Vec::new();
-        encode_row(
-            &Row {
-                values: vec![Value::BigInt(4), Value::Varchar("uncomm".into())],
-            },
-            &mut row4_bytes,
-        )
-        .unwrap();
-        op_buf.clear();
-        encode_wal_op(
-            &WalOp::PutRow {
-                table_id: 1,
-                row_id: 4,
-                old_pk: None,
-                row_bytes: row4_bytes,
-            },
-            &mut op_buf,
-        )
-        .unwrap();
-        encode_wal_frame(100, KIND_PUT_ROW, &op_buf, &mut buf).unwrap();
-
-        // Also inject truncated corrupt WAL tail bytes
-        buf.extend_from_slice(b"WAL1\x01\x02\x03");
-        wal_file.write_all(&buf).unwrap();
+        let mut wbuf = Vec::new();
+        encode_wal_frame(99, KIND_BEGIN, &[], &mut wbuf).unwrap();
+        wbuf.extend_from_slice(b"WAL2\x01\x02\x03");
+        wal_file.write_all(&wbuf).unwrap();
         wal_file.sync_all().unwrap();
-
-        // Also inject torn garbage into the tail of table .dat file
-        let mut dat_file = OpenOptions::new().append(true).open(&dat_path).unwrap();
-        dat_file.write_all(b"MVD1CORRUPT_TAIL_BYTES").unwrap();
-        dat_file.sync_all().unwrap();
     }
 
-    // Reopen and verify Redo truncates torn .dat and WAL tails, replays id=2 and id=3, drops id=4!
+    let expected = ExecResult::Query {
+        columns: vec!["id".into(), "content".into()],
+        rows: vec![
+            vec![json!(1), json!("first")],
+            vec![json!(2), json!("normal")],
+        ],
+    };
     let mut db_rec = Database::open(&dir.0).unwrap();
     let res = db_rec
         .execute_sql("SELECT id, content FROM docs ORDER BY id;", SearchMode::Exact)
         .unwrap();
-    assert_eq!(
-        res,
-        ExecResult::Query {
-            columns: vec!["id".into(), "content".into()],
-            rows: vec![
-                vec![json!(1), json!("ckpt")],
-                vec![json!(2), json!("normal")],
-                vec![json!(3), json!("redo")],
-            ],
-        }
-    );
+    assert_eq!(res, expected);
 
-    // Reopen a second time without shutdown to confirm idempotent checkpoint & recovery
+    // New commits after the cut-off tail must survive another crash-style reopen.
+    db_rec
+        .execute_sql("INSERT INTO docs VALUES (3, 'after');", SearchMode::Exact)
+        .unwrap();
     drop(db_rec);
     let mut db_rec2 = Database::open(&dir.0).unwrap();
     let res2 = db_rec2
         .execute_sql("SELECT id, content FROM docs ORDER BY id;", SearchMode::Exact)
         .unwrap();
-    assert_eq!(res, res2);
+    assert_eq!(
+        res2,
+        ExecResult::Query {
+            columns: vec!["id".into(), "content".into()],
+            rows: vec![
+                vec![json!(1), json!("first")],
+                vec![json!(2), json!("normal")],
+                vec![json!(3), json!("after")],
+            ],
+        }
+    );
+}
+
+#[test]
+fn test_multi_table_transaction_is_atomic_across_restart() {
+    let dir = TempDir::new("multi_table_txn");
+    {
+        let mut db = Database::open(&dir.0).unwrap();
+        for sql in [
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v VECTOR(2));",
+            "CREATE TABLE b (id BIGINT PRIMARY KEY, s VARCHAR(8));",
+            "BEGIN;",
+            "INSERT INTO a VALUES (1, '[1, 2]'), (2, '[3, 4]');",
+            "INSERT INTO b VALUES (10, 'x');",
+            "CREATE TABLE c (id BIGINT PRIMARY KEY);",
+            "INSERT INTO c VALUES (7);",
+            "COMMIT;",
+            "BEGIN;",
+            "INSERT INTO a VALUES (3, '[5, 6]');",
+            "INSERT INTO b VALUES (11, 'y');",
+        ] {
+            db.execute_sql(sql, SearchMode::Exact).unwrap();
+        }
+        drop(db); // crash with the second transaction still open
+    }
+    let mut db = Database::open(&dir.0).unwrap();
+    for (sql, ids) in [
+        ("SELECT id FROM a ORDER BY id;", vec![1, 2]),
+        ("SELECT id FROM b ORDER BY id;", vec![10]),
+        ("SELECT id FROM c ORDER BY id;", vec![7]),
+    ] {
+        let res = db.execute_sql(sql, SearchMode::Exact).unwrap();
+        assert_eq!(
+            res,
+            ExecResult::Query {
+                columns: vec!["id".into()],
+                rows: ids.into_iter().map(|i| vec![json!(i)]).collect(),
+            }
+        );
+    }
 }

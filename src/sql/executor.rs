@@ -2,24 +2,21 @@ use crate::catalog::manager::Catalog;
 use crate::catalog::schema::TableSchema;
 use crate::common::error::{DbError, ErrorCode, Result};
 use crate::common::types::{
-    parse_vector_str, validate_f64_slice_as_f32, DataType, ExecResult, Row, RowId, SearchMode,
-    TableId, Value,
+    parse_vector_str, validate_f64_slice_as_f32, Cell, DataType, ExecResult, Row, RowAccess, RowId,
+    SearchMode, TableId, Value,
 };
-use crate::recovery::checkpoint::{build_hnsw_from_disk, perform_checkpoint};
+use crate::recovery::checkpoint::perform_checkpoint;
 use crate::recovery::redo::recover_database;
 use crate::recovery::wal::WalManager;
 use crate::sql::ast::{
     BinaryOp, Expr, LiteralValue, OrderByItem, OrderByTarget, QueryVector, SelectItem, Statement,
 };
 use crate::sql::parser::Parser;
-use crate::storage::codec::{
-    decode_row_selective, encode_row, extract_pk_from_row_bytes, extract_vector_from_row_bytes,
-};
-use crate::storage::engine::{pk_of_row, StorageEngine};
+use crate::storage::engine::{mem_budget_bytes, pk_of_row, GroupEnd, StorageEngine};
+use crate::storage::mem::MemTable;
 use crate::transaction::manager::TransactionManager;
 use crate::transaction::operation::WalOp;
 use crate::vector::distance::{l2_distance, l2_distance_squared};
-use crate::vector::index::HnswIndex;
 use crate::vector::search::{TopKCandidate, TopKHeap};
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
@@ -89,26 +86,27 @@ pub enum BoundSelectItem {
     },
 }
 
-/// Complete MiniVectorDB database engine combining SQL execution, disk storage,
-/// HNSW vector indexing, single-writer transactions, WAL, and crash recovery.
+type PutList = Vec<(RowId, Option<i64>, Row)>;
+type DeleteList = Vec<(RowId, Option<i64>)>;
+
+/// Complete MiniVectorDB database engine combining SQL execution, storage,
+/// exact vector search, single-writer transactions and crash recovery.
 pub struct Database {
     pub data_dir: PathBuf,
     pub storage: StorageEngine,
     pub wal: WalManager,
     pub txn_mgr: TransactionManager,
-    pub hnsw_indexes: HashMap<(TableId, usize), HnswIndex>,
 }
 
 impl Database {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let (storage, wal, hnsw_indexes) = recover_database(&data_dir)?;
+        let (storage, wal) = recover_database(&data_dir)?;
         Ok(Self {
             data_dir,
             storage,
             wal,
             txn_mgr: TransactionManager::new(),
-            hnsw_indexes,
         })
     }
 
@@ -134,7 +132,7 @@ impl Database {
                 table_name,
                 columns,
                 rows,
-            } => self.exec_insert(&table_name, columns.as_deref(), &rows),
+            } => self.exec_insert(&table_name, columns.as_deref(), rows),
             Statement::Select {
                 items,
                 table_name,
@@ -161,47 +159,48 @@ impl Database {
         }
     }
 
+    /// Normal shutdown: the open transaction (if any) is rolled back. Every acknowledged
+    /// commit is already durable, so nothing has to be flushed here; a checkpoint is only
+    /// taken when it actually reclaims space.
     pub fn shutdown(&mut self) -> Result<()> {
         self.txn_mgr.discard_if_active();
-        let any_hnsw_dirty = self.hnsw_indexes.values().any(|idx| idx.is_dirty());
-        let any_table_needs_compact = self.storage.tables.values().any(|dt| dt.needs_compaction());
-        let has_ckp = self.data_dir.join("checkpoint.meta").exists();
-        if !self.wal.dirty_since_checkpoint
-            && !any_hnsw_dirty
-            && !any_table_needs_compact
-            && has_ckp
-        {
-            return Ok(());
-        }
-        for dt in self.storage.tables.values_mut() {
-            dt.cache.clear();
-            dt.cache.shrink_to_fit();
-        }
-        if !any_table_needs_compact {
-            for hnsw in self.hnsw_indexes.values_mut() {
-                hnsw.release_inmem_vectors_for_shutdown();
+        if crate::storage::file::sync_policy() != crate::storage::file::SyncPolicy::Full {
+            for dt in self.storage.tables.values() {
+                dt.file.sync()?;
             }
         }
-        perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
+        let any_table_needs_compact = self.storage.tables.values().any(|dt| dt.needs_compaction());
+        if any_table_needs_compact || self.wal.should_checkpoint() {
+            perform_checkpoint(&mut self.storage, &mut self.wal, false)?;
+        }
+        Ok(())
+    }
+
+    fn after_write(&mut self, tid: Option<TableId>) -> Result<()> {
+        let compact = match tid {
+            Some(t) => self.storage.tables.get(&t).is_some_and(|dt| dt.needs_compaction()),
+            None => self.storage.tables.values().any(|dt| dt.needs_compaction()),
+        };
+        if compact || self.wal.should_checkpoint() {
+            perform_checkpoint(&mut self.storage, &mut self.wal, false)?;
+        }
+        if self.storage.mem_bytes() > mem_budget_bytes() {
+            self.storage.enforce_memory_budget()?;
+        }
         Ok(())
     }
 
     fn effective_catalog(&self) -> Catalog {
+        let mut cat = self.storage.catalog.clone();
         if let Some(txn) = &self.txn_mgr.active {
-            if txn.created_tables.is_empty() && txn.created_indexes.is_empty() {
-                return self.storage.catalog.clone();
-            }
-            let mut cat = self.storage.catalog.clone();
             for schema in &txn.created_tables {
                 let _ = cat.insert_table(schema.clone());
             }
             for (tid, idx) in &txn.created_indexes {
                 let _ = cat.add_vector_index(*tid, idx.clone());
             }
-            cat
-        } else {
-            self.storage.catalog.clone()
         }
+        cat
     }
 
     fn resolve_table_schema(&self, table_name: &str) -> Result<TableSchema> {
@@ -242,12 +241,13 @@ impl Database {
         self.wal
             .append_committed_txn(&[WalOp::CreateTable(schema.clone())])?;
         self.storage.create_table(schema)?;
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
-        }
+        self.after_write(None)?;
         Ok(ExecResult::Ok)
     }
 
+    /// The vector index is a schema-level object: searches are always answered by the
+    /// exact SIMD scan over the in-memory vector column, which stays consistent with the
+    /// table (and the open transaction) by construction and has recall 1.0 in every mode.
     fn exec_create_vector_index(
         &mut self,
         index_name: &str,
@@ -268,164 +268,114 @@ impl Database {
         self.storage
             .catalog
             .add_vector_index(tid, idx_schema.clone())?;
-        self.storage
-            .get_table_mut(tid)?
-            .schema
-            .indexes
-            .push(idx_schema.clone());
-        let hnsw = {
-            let dt = self.storage.get_table(tid)?;
-            build_hnsw_from_disk(
-                &self.data_dir,
-                dt,
-                idx_schema.col_idx,
-                idx_schema.dim,
-                &idx_schema.name,
-            )?
-        };
-        self.hnsw_indexes.insert((tid, idx_schema.col_idx), hnsw);
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
-        }
+        self.storage.get_table_mut(tid)?.schema.indexes.push(idx_schema);
+        self.after_write(None)?;
         Ok(ExecResult::Ok)
     }
 
-    fn apply_table_write_and_indexes(
-        &mut self,
-        tid: TableId,
-        puts: Vec<(RowId, Option<i64>, Row)>,
-        deletes: &[(RowId, Option<i64>)],
-        wal_ops: &[WalOp],
-    ) -> Result<()> {
-        let indexes = self.storage.get_table(tid)?.schema.indexes.clone();
-        if indexes.is_empty() {
-            let dt = self.storage.get_table_mut(tid)?;
-            return dt.apply_batch_owned_with_wal(puts, deletes, wal_ops, false);
-        }
-        let pk_col_idx = self.storage.get_table(tid)?.schema.pk_col_idx;
-        let mut idx_puts: Vec<(usize, Vec<(RowId, Option<i64>, Option<Vec<f32>>)>)> =
-            Vec::with_capacity(indexes.len());
-        for idx_schema in &indexes {
-            let mut col_updates = Vec::with_capacity(puts.len());
-            for (rid, _, row) in &puts {
-                let pk = pk_col_idx.and_then(|i| match &row.values[i] {
-                    Value::BigInt(v) => Some(*v),
-                    _ => None,
-                });
-                let vec_opt = match &row.values[idx_schema.col_idx] {
-                    Value::Vector(v) => Some(v.clone()),
-                    _ => None,
-                };
-                col_updates.push((*rid, pk, vec_opt));
-            }
-            idx_puts.push((idx_schema.col_idx, col_updates));
-        }
-        {
-            let dt = self.storage.get_table_mut(tid)?;
-            dt.apply_batch_owned_with_wal(puts, deletes, wal_ops, false)?;
-        }
-        for (idx_schema, (_, col_updates)) in indexes.iter().zip(idx_puts.iter()) {
-            if let Some(hnsw) = self.hnsw_indexes.get_mut(&(tid, idx_schema.col_idx)) {
-                for &(rid, _) in deletes {
-                    hnsw.delete(rid);
-                }
-                for (rid, pk, vec_opt) in col_updates {
-                    if let Some(vec) = vec_opt {
-                        hnsw.upsert(*rid, *pk, vec)?;
-                    } else {
-                        hnsw.delete(*rid);
-                    }
-                }
-                if hnsw.needs_rebuild() {
-                    let dt = self.storage.get_table(tid)?;
-                    let rebuilt = build_hnsw_from_disk(
-                        &self.data_dir,
-                        dt,
-                        idx_schema.col_idx,
-                        idx_schema.dim,
-                        &idx_schema.name,
-                    )?;
-                    self.hnsw_indexes.insert((tid, idx_schema.col_idx), rebuilt);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_index_updates_for_table(
-        &mut self,
-        tid: TableId,
-        puts: &[(RowId, Option<i64>, Row)],
-        deletes: &[(RowId, Option<i64>)],
-    ) -> Result<()> {
-        let schema = self.storage.get_table(tid)?.schema.clone();
-        for idx_schema in &schema.indexes {
-            if let Some(hnsw) = self.hnsw_indexes.get_mut(&(tid, idx_schema.col_idx)) {
-                for &(rid, _) in deletes {
-                    hnsw.delete(rid);
-                }
-                for (rid, _, row) in puts {
-                    let pk = pk_of_row(&schema, row);
-                    if let Value::Vector(ref vec) = row.values[idx_schema.col_idx] {
-                        hnsw.upsert(*rid, pk, vec)?;
-                    } else {
-                        hnsw.delete(*rid);
-                    }
-                }
-                if hnsw.needs_rebuild() {
-                    let dt = self.storage.get_table(tid)?;
-                    let rebuilt = build_hnsw_from_disk(
-                        &self.data_dir,
-                        dt,
-                        idx_schema.col_idx,
-                        idx_schema.dim,
-                        &idx_schema.name,
-                    )?;
-                    self.hnsw_indexes.insert((tid, idx_schema.col_idx), rebuilt);
-                }
-            }
-        }
-        Ok(())
+    /// Durably commit one group of changes to a single table, then publish it.
+    fn commit_table_group(&mut self, tid: TableId, puts: PutList, deletes: &DeleteList) -> Result<()> {
+        let dt = self.storage.get_table_mut(tid)?;
+        let locs = dt.append_group(&puts, deletes, GroupEnd::Commit)?;
+        dt.apply_group(puts, deletes, locs)?;
+        self.after_write(Some(tid))
     }
 
     fn exec_commit(&mut self) -> Result<ExecResult> {
         let txn = self.txn_mgr.take_for_commit()?;
-        let wal_ops = TransactionManager::build_wal_ops(&txn)?;
-        if wal_ops.is_empty() {
-            return Ok(ExecResult::Ok);
-        }
-        self.wal.append_committed_txn(&wal_ops)?;
-
-        for schema in txn.created_tables {
-            self.storage.create_table(schema)?;
-        }
-        let mut new_indexes = Vec::new();
-        for (tid, idx) in txn.created_indexes {
-            self.storage.catalog.add_vector_index(tid, idx.clone())?;
-            self.storage
-                .get_table_mut(tid)?
-                .schema
-                .indexes
-                .push(idx.clone());
-            new_indexes.push((tid, idx));
-        }
+        let has_ddl = !txn.created_tables.is_empty() || !txn.created_indexes.is_empty();
+        let mut writes: Vec<(TableId, PutList, DeleteList)> = Vec::new();
         for (tid, tws) in txn.table_writes {
-            let puts: Vec<(RowId, Option<i64>, Row)> = tws
+            if tws.puts.is_empty() && tws.deletes.is_empty() {
+                continue;
+            }
+            let puts: PutList = tws
                 .puts
                 .into_iter()
                 .map(|(rid, (old_pk, row))| (rid, old_pk, row))
                 .collect();
-            let deletes: Vec<(RowId, Option<i64>)> = tws.deletes.into_iter().collect();
-            self.apply_table_write_and_indexes(tid, puts, &deletes, &wal_ops)?;
+            let deletes: DeleteList = tws.deletes.into_iter().collect();
+            writes.push((tid, puts, deletes));
         }
-        for (tid, idx) in new_indexes {
-            let dt = self.storage.get_table(tid)?;
-            let hnsw = build_hnsw_from_disk(&self.data_dir, dt, idx.col_idx, idx.dim, &idx.name)?;
-            self.hnsw_indexes.insert((tid, idx.col_idx), hnsw);
+        if !has_ddl && writes.is_empty() {
+            return Ok(ExecResult::Ok);
         }
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
+        if !has_ddl && writes.len() == 1 {
+            // Single-table transaction: its group is self-committing (one fdatasync).
+            let (tid, puts, deletes) = writes.pop().unwrap();
+            self.commit_table_group(tid, puts, &deletes)?;
+            return Ok(ExecResult::Ok);
         }
+
+        // Multi-file transaction: stage every table group as pending, then make the
+        // whole transaction durable with a single commit record in the WAL.
+        let txn_id = self.wal.alloc_txn_id();
+        let mut created: Vec<TableId> = Vec::new();
+        let mut undo: Vec<(TableId, u64, u64)> = Vec::new();
+        let mut staged: Vec<(TableId, PutList, DeleteList, Vec<(u64, u32)>)> = Vec::new();
+        let mut ops: Vec<WalOp> = Vec::new();
+        for schema in &txn.created_tables {
+            ops.push(WalOp::CreateTable(schema.clone()));
+        }
+        for (tid, idx) in &txn.created_indexes {
+            ops.push(WalOp::CreateIndex {
+                table_id: *tid,
+                index: idx.clone(),
+            });
+        }
+
+        let mut res: Result<()> = Ok(());
+        for schema in &txn.created_tables {
+            match self.storage.create_table(schema.clone()) {
+                Ok(()) => created.push(schema.table_id),
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            }
+        }
+        if res.is_ok() {
+            for (tid, puts, deletes) in writes {
+                let step = (|| -> Result<Vec<(u64, u32)>> {
+                    let dt = self.storage.get_table_mut(tid)?;
+                    undo.push((tid, dt.file.len(), dt.total_frames));
+                    dt.append_group(&puts, &deletes, GroupEnd::Pending(txn_id))
+                })();
+                match step {
+                    Ok(locs) => staged.push((tid, puts, deletes, locs)),
+                    Err(e) => {
+                        res = Err(e);
+                        break;
+                    }
+                }
+            }
+        }
+        if res.is_ok() {
+            res = self.wal.append_commit(txn_id, &ops);
+        }
+        if let Err(e) = res {
+            // Not committed: remove every trace so later commits are not shadowed.
+            for (tid, len, frames) in undo {
+                if !created.contains(&tid) {
+                    if let Ok(dt) = self.storage.get_table_mut(tid) {
+                        let _ = dt.rollback_file_to(len, frames);
+                    }
+                }
+            }
+            for tid in created {
+                self.storage.drop_uncommitted_table(tid);
+            }
+            return Err(e);
+        }
+
+        for (tid, puts, deletes, locs) in staged {
+            self.storage.get_table_mut(tid)?.apply_group(puts, &deletes, locs)?;
+        }
+        for (tid, idx) in txn.created_indexes {
+            self.storage.catalog.add_vector_index(tid, idx.clone())?;
+            self.storage.get_table_mut(tid)?.schema.indexes.push(idx);
+        }
+        self.after_write(None)?;
         Ok(ExecResult::Ok)
     }
 
@@ -447,11 +397,7 @@ impl Database {
     }
 
     fn next_row_id_for(&self, tid: TableId) -> RowId {
-        let base = self
-            .storage
-            .tables
-            .get(&tid)
-            .map_or(1, |dt| dt.next_row_id);
+        let base = self.storage.tables.get(&tid).map_or(1, |dt| dt.next_row_id);
         if let Some(txn) = &self.txn_mgr.active {
             if let Some(tws) = txn.table_writes.get(&tid) {
                 if let Some(next_id) = tws.next_row_id {
@@ -466,13 +412,13 @@ impl Database {
         &mut self,
         table_name: &str,
         col_names: Option<&[String]>,
-        raw_rows: &[Vec<LiteralValue>],
+        raw_rows: Vec<Vec<LiteralValue>>,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         let col_mapping = resolve_insert_columns(&schema, col_names)?;
 
         let mut prepared_rows = Vec::with_capacity(raw_rows.len());
-        let mut batch_pks = HashSet::new();
+        let mut batch_pks = HashSet::with_capacity(raw_rows.len());
 
         for raw_vals in raw_rows {
             if raw_vals.len() != col_mapping.len() {
@@ -486,13 +432,10 @@ impl Database {
                 ));
             }
             let mut row_vals = vec![Value::Null; schema.columns.len()];
-            for (val_idx, &col_idx) in col_mapping.iter().enumerate() {
+            for (lit, &col_idx) in raw_vals.into_iter().zip(col_mapping.iter()) {
                 let col_schema = &schema.columns[col_idx];
-                row_vals[col_idx] = coerce_literal(
-                    &raw_vals[val_idx],
-                    &col_schema.data_type,
-                    col_schema.is_primary_key,
-                )?;
+                row_vals[col_idx] =
+                    coerce_literal_owned(lit, &col_schema.data_type, col_schema.is_primary_key)?;
             }
             if let Some(pk_idx) = schema.pk_col_idx {
                 match &row_vals[pk_idx] {
@@ -533,27 +476,12 @@ impl Database {
             return Ok(ExecResult::AffectedRows(count));
         }
 
-        let mut puts = Vec::with_capacity(count);
-        let mut wal_ops = Vec::with_capacity(count);
+        let mut puts: PutList = Vec::with_capacity(count);
         for row in prepared_rows {
-            let rid = next_rid;
+            puts.push((next_rid, None, row));
             next_rid += 1;
-            let mut row_bytes = Vec::new();
-            encode_row(&row, &mut row_bytes)?;
-            wal_ops.push(WalOp::PutRow {
-                table_id: schema.table_id,
-                row_id: rid,
-                old_pk: None,
-                row_bytes,
-            });
-            puts.push((rid, None, row));
         }
-
-        self.wal.append_committed_txn(&wal_ops)?;
-        self.apply_table_write_and_indexes(schema.table_id, puts, &[], &wal_ops)?;
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
-        }
+        self.commit_table_group(schema.table_id, puts, &Vec::new())?;
         Ok(ExecResult::AffectedRows(count))
     }
 
@@ -581,38 +509,38 @@ impl Database {
 
         let mut results = Vec::new();
         if let Some(dt) = self.storage.tables.get(&tid) {
-            if dt.cache_covers_all() {
-                for (rid, row) in dt.cache.iter() {
-                    if let Some(tws) = tws_opt {
-                        if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
-                            continue;
-                        }
-                    }
-                    let ok = match where_expr {
-                        Some(expr) => eval_where(expr, row)?,
-                        None => true,
-                    };
-                    if ok {
-                        results.push((rid, row.clone()));
-                        if results.len() >= max_rows {
-                            break;
+            let pk_probe = where_expr.and_then(|e| pk_eq_literal(schema, e));
+            if let (Some(pk), Some(expr)) = (pk_probe, where_expr) {
+                // Point lookup through the primary-key index.
+                if let Some(&rid) = dt.pk_index.get(&pk) {
+                    let hidden = tws_opt
+                        .is_some_and(|t| t.deletes.contains_key(&rid) || t.puts.contains_key(&rid));
+                    if !hidden {
+                        let got = dt.with_row(rid, &where_cols, |row| {
+                            if eval_where(expr, &row)? {
+                                Ok(Some(row.materialize(needed_cols)?))
+                            } else {
+                                Ok(None)
+                            }
+                        })?;
+                        if let Some(Some(row)) = got {
+                            results.push((rid, row));
                         }
                     }
                 }
             } else {
-                dt.scan_live_streaming(&where_cols, |rid, payload, partial_row| {
+                dt.scan_live(&where_cols, |rid, row| {
                     if let Some(tws) = tws_opt {
                         if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
                             return Ok(true);
                         }
                     }
                     let ok = match where_expr {
-                        Some(expr) => eval_where(expr, &partial_row)?,
+                        Some(expr) => eval_where(expr, &row)?,
                         None => true,
                     };
                     if ok {
-                        let full_needed = decode_row_selective(payload, schema, needed_cols)?;
-                        results.push((rid, full_needed));
+                        results.push((rid, row.materialize(needed_cols)?));
                         if results.len() >= max_rows {
                             return Ok(false);
                         }
@@ -692,7 +620,7 @@ impl Database {
         let all_cols = vec![true; schema.columns.len()];
         let candidates = self.collect_matching_rows(&schema, bound_where.as_ref(), &all_cols)?;
 
-        let mut updates: Vec<(RowId, Option<i64>, Row)> = Vec::with_capacity(candidates.len());
+        let mut updates: PutList = Vec::with_capacity(candidates.len());
         let mut old_pks_set = HashSet::new();
         let mut new_pks_set = HashSet::new();
 
@@ -759,22 +687,7 @@ impl Database {
             return Ok(ExecResult::AffectedRows(affected));
         }
 
-        let mut wal_ops = Vec::with_capacity(affected);
-        for (rid, old_pk, row) in &updates {
-            let mut row_bytes = Vec::new();
-            encode_row(row, &mut row_bytes)?;
-            wal_ops.push(WalOp::PutRow {
-                table_id: schema.table_id,
-                row_id: *rid,
-                old_pk: *old_pk,
-                row_bytes,
-            });
-        }
-        self.wal.append_committed_txn(&wal_ops)?;
-        self.apply_table_write_and_indexes(schema.table_id, updates, &[], &wal_ops)?;
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
-        }
+        self.commit_table_group(schema.table_id, updates, &Vec::new())?;
         Ok(ExecResult::AffectedRows(affected))
     }
 
@@ -794,7 +707,7 @@ impl Database {
             needed[pk_idx] = true;
         }
         let candidates = self.collect_matching_rows(&schema, bound_where.as_ref(), &needed)?;
-        let mut to_delete = Vec::with_capacity(candidates.len());
+        let mut to_delete: DeleteList = Vec::with_capacity(candidates.len());
         for (rid, row) in candidates {
             to_delete.push((rid, pk_of_row(&schema, &row)));
         }
@@ -817,7 +730,7 @@ impl Database {
                         .storage
                         .tables
                         .get(&schema.table_id)
-                        .is_some_and(|dt| dt.row_locations.contains_key(&rid))
+                        .is_some_and(|dt| dt.contains_row(rid))
                     {
                         tws.deletes.insert(rid, None);
                     }
@@ -831,23 +744,7 @@ impl Database {
             return Ok(ExecResult::AffectedRows(affected));
         }
 
-        let wal_ops: Vec<WalOp> = to_delete
-            .iter()
-            .map(|&(rid, old_pk)| WalOp::DeleteRow {
-                table_id: schema.table_id,
-                row_id: rid,
-                old_pk,
-            })
-            .collect();
-        self.wal.append_committed_txn(&wal_ops)?;
-        {
-            let dt = self.storage.get_table_mut(schema.table_id)?;
-            dt.apply_batch(&[], &to_delete, false)?;
-        }
-        self.apply_index_updates_for_table(schema.table_id, &[], &to_delete)?;
-        if self.wal.should_checkpoint() {
-            perform_checkpoint(&mut self.storage, &mut self.wal, &mut self.hnsw_indexes, false)?;
-        }
+        self.commit_table_group(schema.table_id, Vec::new(), &to_delete)?;
         Ok(ExecResult::AffectedRows(affected))
     }
 
@@ -858,7 +755,7 @@ impl Database {
         where_clause: Option<&Expr>,
         order_by: &[OrderByItem],
         limit: Option<usize>,
-        search_mode: SearchMode,
+        _search_mode: SearchMode,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         let (bound_items, alias_map) = bind_select_items(&schema, items)?;
@@ -900,25 +797,10 @@ impl Database {
             }
         }
 
+        // Vector TopK (identical in `exact` and `ann` mode: always the exact answer).
         if bound_order.len() == 1 {
             if let (BoundOrderKey::L2Distance { col_idx, query }, true) = &bound_order[0] {
                 if let Some(k) = limit {
-                    if search_mode == SearchMode::Ann
-                        && self.hnsw_indexes.contains_key(&(schema.table_id, *col_idx))
-                    {
-                        if let Some(rows) = self.try_ann_topk(
-                            &schema,
-                            *col_idx,
-                            query,
-                            k,
-                            bound_where.as_ref(),
-                            &needed_cols,
-                            &bound_items,
-                        )? {
-                            return Ok(ExecResult::Query { columns, rows });
-                        }
-                    }
-
                     let rows = self.exact_vector_topk(
                         &schema,
                         *col_idx,
@@ -995,13 +877,12 @@ impl Database {
         columns: &[String],
         k: usize,
     ) -> Result<ExecResult> {
-        #[derive(Clone)]
         struct HeapEntry {
             keys: Vec<SortVal>,
             pk: Option<i64>,
             row_id: RowId,
             row: Row,
-            dirs: Vec<bool>,
+            dirs: std::rc::Rc<Vec<bool>>,
         }
         impl PartialEq for HeapEntry {
             fn eq(&self, other: &Self) -> bool {
@@ -1028,7 +909,8 @@ impl Database {
             }
         }
 
-        let dirs: Vec<bool> = bound_order.iter().map(|(_, asc)| *asc).collect();
+        let dirs: std::rc::Rc<Vec<bool>> =
+            std::rc::Rc::new(bound_order.iter().map(|(_, asc)| *asc).collect());
         let mut scan_cols = vec![false; schema.columns.len()];
         if let Some(expr) = where_expr {
             collect_expr_cols(expr, &mut scan_cols);
@@ -1050,25 +932,25 @@ impl Database {
             .as_ref()
             .and_then(|t| t.table_writes.get(&tid));
         let mut heap: std::collections::BinaryHeap<HeapEntry> =
-            std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+            std::collections::BinaryHeap::with_capacity(k.min(1 << 16).saturating_add(1));
 
         if let Some(dt) = self.storage.tables.get(&tid) {
-            dt.scan_live_streaming(&scan_cols, |rid, payload, partial_row| {
+            dt.scan_live(&scan_cols, |rid, row| {
                 if let Some(tws) = tws_opt {
                     if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
                         return Ok(true);
                     }
                 }
                 if let Some(expr) = where_expr {
-                    if !eval_where(expr, &partial_row)? {
+                    if !eval_where(expr, &row)? {
                         return Ok(true);
                     }
                 }
                 let mut keys = Vec::with_capacity(bound_order.len());
                 for (key, _) in bound_order {
-                    keys.push(eval_sort_key(key, &partial_row)?);
+                    keys.push(eval_sort_key(key, &row)?);
                 }
-                let pk = pk_of_row(schema, &partial_row);
+                let pk = cell_pk(schema, &row);
                 let accept = if heap.len() < k {
                     true
                 } else if let Some(worst) = heap.peek() {
@@ -1078,12 +960,11 @@ impl Database {
                     true
                 };
                 if accept {
-                    let full_row = decode_row_selective(payload, schema, needed_cols)?;
                     let entry = HeapEntry {
                         keys,
                         pk,
                         row_id: rid,
-                        row: full_row,
+                        row: row.materialize(needed_cols)?,
                         dirs: dirs.clone(),
                     };
                     if heap.len() < k {
@@ -1136,8 +1017,10 @@ impl Database {
         })
     }
 
+    /// Exact TopK by `(distance, primary key, row id)` over the rows that pass `WHERE`
+    /// and are visible to the current transaction.
     #[allow(clippy::too_many_arguments)]
-    fn try_ann_topk(
+    fn exact_vector_topk(
         &mut self,
         schema: &TableSchema,
         col_idx: usize,
@@ -1146,366 +1029,99 @@ impl Database {
         where_expr: Option<&BoundExpr>,
         needed_cols: &[bool],
         bound_items: &[BoundSelectItem],
-    ) -> Result<Option<Vec<Vec<JsonValue>>>> {
-        let tid = schema.table_id;
-        let dt_ref = self.storage.tables.get(&tid);
-        if where_expr.is_some()
-            && dt_ref.is_some_and(|dt| dt.cache_covers_all() && dt.row_locations.len() <= 20_000)
-        {
-            return Ok(None);
-        }
-
-        let tws_opt = self
-            .txn_mgr
-            .active
-            .as_ref()
-            .and_then(|t| t.table_writes.get(&tid));
-        let mut tx_excluded = HashSet::new();
-        if let Some(tws) = tws_opt {
-            for &rid in tws.deletes.keys() {
-                tx_excluded.insert(rid);
-            }
-            for &rid in tws.puts.keys() {
-                tx_excluded.insert(rid);
-            }
-        }
-
-        let hnsw = self.hnsw_indexes.get_mut(&(tid, col_idx)).unwrap();
-
-        let (cands, exhaustive) = if let Some(w_expr) = where_expr {
-            let Some(dt) = dt_ref else {
-                return Ok(None);
-            };
-            let mut where_cols = vec![false; schema.columns.len()];
-            collect_expr_cols(w_expr, &mut where_cols);
-            let mut filter_fn = |rid: RowId| -> Result<bool> {
-                if let Some(cached) = dt.cache.get(rid) {
-                    return eval_where(w_expr, cached);
-                }
-                let &(off, flen) = dt.row_locations.get(&rid).ok_or_else(|| {
-                    DbError::new(ErrorCode::InternalError, "HNSW row_id missing in DiskTable")
-                })?;
-                let frame = dt.file.read_frame_at(off, flen)?;
-                let partial = decode_row_selective(&frame.payload, schema, &where_cols)?;
-                eval_where(w_expr, &partial)
-            };
-            hnsw.search_knn(query, k, &tx_excluded, Some(&mut filter_fn))?
-        } else {
-            hnsw.search_knn(query, k, &tx_excluded, None::<&mut fn(RowId) -> Result<bool>>)?
-        };
-
-        if cands.len() < k && !exhaustive {
-            return Ok(None);
-        }
-
-        if tws_opt.is_none() {
-            if let Some(dt) = dt_ref {
-                let mut out_rows = Vec::with_capacity(cands.len());
-                for (_, _, rid) in cands {
-                    if let Some(cached) = dt.cache.get(rid) {
-                        out_rows.push(project_row(bound_items, cached)?);
-                    } else {
-                        let &(off, flen) = dt.row_locations.get(&rid).ok_or_else(|| {
-                            DbError::new(
-                                ErrorCode::InternalError,
-                                "HNSW row_id missing in DiskTable",
-                            )
-                        })?;
-                        let frame = dt.file.read_frame_at(off, flen)?;
-                        let row = decode_row_selective(&frame.payload, schema, needed_cols)?;
-                        out_rows.push(project_row(bound_items, &row)?);
-                    }
-                }
-                return Ok(Some(out_rows));
-            }
-        }
-
-        let mut heap = TopKHeap::new(k);
-        if let Some(dt) = dt_ref {
-            for (dist_sq, pk, rid) in cands {
-                if !heap.would_accept(dist_sq, pk, rid) {
-                    continue;
-                }
-                let row = if let Some(cached) = dt.cache.get(rid) {
-                    cached.clone()
-                } else {
-                    let &(off, flen) = dt.row_locations.get(&rid).ok_or_else(|| {
-                        DbError::new(ErrorCode::InternalError, "HNSW row_id missing in DiskTable")
-                    })?;
-                    let frame = dt.file.read_frame_at(off, flen)?;
-                    decode_row_selective(&frame.payload, schema, needed_cols)?
-                };
-                heap.push(TopKCandidate {
-                    dist_sq,
-                    pk,
-                    row_id: rid,
-                    row,
-                });
-            }
-        }
-
-        if let Some(tws) = tws_opt {
-            for (&rid, (_, row)) in &tws.puts {
-                if let Some(w_expr) = where_expr {
-                    if !eval_where(w_expr, row)? {
-                        continue;
-                    }
-                }
-                let dist_sq = match &row.values[col_idx] {
-                    Value::Vector(v) => l2_distance_squared(v, query)?,
-                    Value::Null => continue,
-                    _ => {
-                        return Err(DbError::new(
-                            ErrorCode::TypeMismatch,
-                            "expected VECTOR column",
-                        ));
-                    }
-                };
-                let pk = pk_of_row(schema, row);
-                if heap.would_accept(dist_sq, pk, rid) {
-                    heap.push(TopKCandidate {
-                        dist_sq,
-                        pk,
-                        row_id: rid,
-                        row: row.clone(),
-                    });
-                }
-            }
-        }
-
-        let winners = heap.into_sorted_vec();
-        let mut out_rows = Vec::with_capacity(winners.len());
-        for cand in winners {
-            out_rows.push(project_row(bound_items, &cand.row)?);
-        }
-        Ok(Some(out_rows))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn exact_vector_topk(
-        &self,
-        schema: &TableSchema,
-        col_idx: usize,
-        query: &[f32],
-        k: usize,
-        where_expr: Option<&BoundExpr>,
-        needed_cols: &[bool],
-        bound_items: &[BoundSelectItem],
     ) -> Result<Vec<Vec<JsonValue>>> {
-        let mut where_cols = vec![false; schema.columns.len()];
-        if let Some(expr) = where_expr {
-            collect_expr_cols(expr, &mut where_cols);
+        enum Winner<'a> {
+            Slot(&'a MemTable, u32),
+            Owned(Row),
+            Txn(&'a Row),
         }
 
         let tid = schema.table_id;
+        if let Some(dt) = self.storage.tables.get_mut(&tid) {
+            dt.prepare_vector_search(col_idx);
+        }
         let tws_opt = self
             .txn_mgr
             .active
             .as_ref()
             .and_then(|t| t.table_writes.get(&tid));
 
-        let mut heap = TopKHeap::new(k);
+        let mut merged: Vec<(f64, Option<i64>, RowId, Winner<'_>)> = Vec::new();
 
         if let Some(dt) = self.storage.tables.get(&tid) {
-            if dt.cache_covers_all() {
-                // Zero-clone fast path: hold only lightweight (dist_sq, pk, rid) in heap,
-                // then resolve winner Rows at the end.
-                #[derive(Clone, Copy)]
-                struct LightCand {
-                    dist_sq: f64,
-                    pk: Option<i64>,
-                    row_id: RowId,
-                }
-                impl PartialEq for LightCand {
-                    fn eq(&self, other: &Self) -> bool {
-                        self.dist_sq.to_bits() == other.dist_sq.to_bits()
-                            && self.pk == other.pk
-                            && self.row_id == other.row_id
+            if let Some(mem) = dt.mem() {
+                let vec_has_nulls = mem.vec_col(col_idx).map_or(true, |v| v.null_count > 0);
+                let need_mask =
+                    where_expr.is_some() || tws_opt.is_some() || mem.has_holes() || vec_has_nulls;
+                let mask = if need_mask {
+                    let mut m = mem.base_mask(Some(col_idx));
+                    if let Some(expr) = where_expr {
+                        apply_where_mask(mem, expr, &mut m)?;
                     }
-                }
-                impl Eq for LightCand {}
-                impl PartialOrd for LightCand {
-                    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                        Some(self.cmp(other))
-                    }
-                }
-                impl Ord for LightCand {
-                    fn cmp(&self, other: &Self) -> Ordering {
-                        self.dist_sq
-                            .total_cmp(&other.dist_sq)
-                            .then_with(|| self.pk.cmp(&other.pk))
-                            .then_with(|| self.row_id.cmp(&other.row_id))
-                    }
-                }
-                let mut light_heap: std::collections::BinaryHeap<LightCand> =
-                    std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
-                let mut cutoff = f64::INFINITY;
-                let mut scanned_via_flat_hnsw = false;
-
-                if where_expr.is_none() && tws_opt.is_none() {
-                    if let Some(hnsw) = self.hnsw_indexes.get(&(tid, col_idx)) {
-                        scanned_via_flat_hnsw = hnsw.scan_in_mem_live(|rid, pk, v| {
-                            let dist_sq = l2_distance_squared(v, query)?;
-                            if light_heap.len() < k {
-                                light_heap.push(LightCand {
-                                    dist_sq,
-                                    pk,
-                                    row_id: rid,
-                                });
-                                if light_heap.len() == k {
-                                    cutoff = light_heap.peek().unwrap().dist_sq;
-                                }
-                            } else if dist_sq <= cutoff {
-                                let cand = LightCand {
-                                    dist_sq,
-                                    pk,
-                                    row_id: rid,
-                                };
-                                let mut replaced = false;
-                                if let Some(mut worst) = light_heap.peek_mut() {
-                                    if cand < *worst {
-                                        *worst = cand;
-                                        replaced = true;
-                                    }
-                                }
-                                if replaced {
-                                    cutoff = light_heap.peek().unwrap().dist_sq;
-                                }
-                            }
-                            Ok(())
-                        })?;
-                    }
-                }
-
-                if !scanned_via_flat_hnsw {
-                    for (rid, row) in dt.cache.iter() {
-                        if let Some(tws) = tws_opt {
-                            if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
-                                continue;
-                            }
-                        }
-                        if let Some(w_expr) = where_expr {
-                            if !eval_where(w_expr, row)? {
-                                continue;
-                            }
-                        }
-                        let dist_sq = match &row.values[col_idx] {
-                            Value::Vector(v) => l2_distance_squared(v, query)?,
-                            Value::Null => continue,
-                            _ => {
-                                return Err(DbError::new(
-                                    ErrorCode::TypeMismatch,
-                                    "expected VECTOR column",
-                                ));
-                            }
-                        };
-                        if light_heap.len() < k {
-                            let pk = pk_of_row(schema, row);
-                            light_heap.push(LightCand {
-                                dist_sq,
-                                pk,
-                                row_id: rid,
-                            });
-                            if light_heap.len() == k {
-                                cutoff = light_heap.peek().unwrap().dist_sq;
-                            }
-                        } else if dist_sq <= cutoff {
-                            let pk = pk_of_row(schema, row);
-                            let cand = LightCand {
-                                dist_sq,
-                                pk,
-                                row_id: rid,
-                            };
-                            let mut replaced = false;
-                            if let Some(mut worst) = light_heap.peek_mut() {
-                                if cand < *worst {
-                                    *worst = cand;
-                                    replaced = true;
-                                }
-                            }
-                            if replaced {
-                                cutoff = light_heap.peek().unwrap().dist_sq;
+                    if let Some(tws) = tws_opt {
+                        for rid in tws.deletes.keys().chain(tws.puts.keys()) {
+                            if let Some(slot) = dt.slot_of(*rid) {
+                                m[slot as usize] = 0;
                             }
                         }
                     }
-                }
-                if tws_opt.is_none() {
-                    let sorted = light_heap.into_sorted_vec();
-                    let mut out_rows = Vec::with_capacity(sorted.len());
-                    for cand in sorted {
-                        if let Some(row) = dt.cache.get(cand.row_id) {
-                            out_rows.push(project_row(bound_items, row)?);
-                        }
-                    }
-                    return Ok(out_rows);
-                }
-                for cand in light_heap {
-                    if let Some(row) = dt.cache.get(cand.row_id) {
-                        heap.push(TopKCandidate {
-                            dist_sq: cand.dist_sq,
-                            pk: cand.pk,
-                            row_id: cand.row_id,
-                            row: row.clone(),
-                        });
-                    }
+                    Some(m)
+                } else {
+                    None
+                };
+                for (d, pk, rid, slot) in mem.topk_exact(col_idx, query, k, mask.as_deref()) {
+                    merged.push((d, pk, rid, Winner::Slot(mem, slot)));
                 }
             } else {
-                dt.scan_live_streaming(&where_cols, |rid, payload, partial_row| {
+                let mut access = vec![false; schema.columns.len()];
+                if let Some(expr) = where_expr {
+                    collect_expr_cols(expr, &mut access);
+                }
+                access[col_idx] = true;
+                if let Some(pk_idx) = schema.pk_col_idx {
+                    access[pk_idx] = true;
+                }
+                let mut heap = TopKHeap::new(k);
+                dt.scan_live(&access, |rid, row| {
                     if let Some(tws) = tws_opt {
                         if tws.deletes.contains_key(&rid) || tws.puts.contains_key(&rid) {
                             return Ok(true);
                         }
                     }
-                    if let Some(w_expr) = where_expr {
-                        if !eval_where(w_expr, &partial_row)? {
+                    if let Some(expr) = where_expr {
+                        if !eval_where(expr, &row)? {
                             return Ok(true);
                         }
                     }
-                    let vec_opt = if where_cols[col_idx] {
-                        match &partial_row.values[col_idx] {
-                            Value::Vector(v) => Some(v.clone()),
-                            Value::Null => None,
-                            _ => None,
-                        }
-                    } else {
-                        extract_vector_from_row_bytes(payload, col_idx)?
-                    };
-                    let Some(vec) = vec_opt else {
+                    let Cell::Vector(v) = row.cell(col_idx) else {
                         return Ok(true);
                     };
-                    let dist_sq = l2_distance_squared(&vec, query)?;
-                    let pk = match schema.pk_col_idx {
-                        Some(pk_idx) => {
-                            if where_cols[pk_idx] {
-                                pk_of_row(schema, &partial_row)
-                            } else {
-                                extract_pk_from_row_bytes(payload, pk_idx)?
-                            }
-                        }
-                        None => None,
-                    };
-                    if heap.would_accept(dist_sq, pk, rid) {
-                        let full_row = decode_row_selective(payload, schema, needed_cols)?;
+                    let dist = l2_distance_squared(v, query)?;
+                    let pk = cell_pk(schema, &row);
+                    if heap.would_accept(dist, pk, rid) {
                         heap.push(TopKCandidate {
-                            dist_sq,
+                            dist,
                             pk,
                             row_id: rid,
-                            row: full_row,
+                            row: row.materialize(needed_cols)?,
                         });
                     }
                     Ok(true)
                 })?;
+                for c in heap.into_sorted_vec() {
+                    merged.push((c.dist, c.pk, c.row_id, Winner::Owned(c.row)));
+                }
             }
         }
 
         if let Some(tws) = tws_opt {
             for (&rid, (_, row)) in &tws.puts {
-                if let Some(w_expr) = where_expr {
-                    if !eval_where(w_expr, row)? {
+                if let Some(expr) = where_expr {
+                    if !eval_where(expr, row)? {
                         continue;
                     }
                 }
-                let dist_sq = match &row.values[col_idx] {
+                let dist = match &row.values[col_idx] {
                     Value::Vector(v) => l2_distance_squared(v, query)?,
                     Value::Null => continue,
                     _ => {
@@ -1515,25 +1131,107 @@ impl Database {
                         ));
                     }
                 };
-                let pk = pk_of_row(schema, row);
-                if heap.would_accept(dist_sq, pk, rid) {
-                    heap.push(TopKCandidate {
-                        dist_sq,
-                        pk,
-                        row_id: rid,
-                        row: row.clone(),
-                    });
-                }
+                merged.push((dist, pk_of_row(schema, row), rid, Winner::Txn(row)));
             }
+            merged.sort_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            merged.truncate(k);
         }
 
-        let winners = heap.into_sorted_vec();
-        let mut out_rows = Vec::with_capacity(winners.len());
-        for cand in winners {
-            out_rows.push(project_row(bound_items, &cand.row)?);
+        let mut out_rows = Vec::with_capacity(merged.len());
+        for (_, _, _, winner) in &merged {
+            out_rows.push(match winner {
+                Winner::Slot(mem, slot) => project_row(bound_items, &mem.row(*slot))?,
+                Winner::Owned(row) => project_row(bound_items, row)?,
+                Winner::Txn(row) => project_row(bound_items, *row)?,
+            });
         }
         Ok(out_rows)
     }
+}
+
+#[inline]
+fn cell_pk<R: RowAccess + ?Sized>(schema: &TableSchema, row: &R) -> Option<i64> {
+    schema.pk_col_idx.and_then(|idx| match row.cell(idx) {
+        Cell::Int(v) => Some(v),
+        _ => None,
+    })
+}
+
+/// If `expr` (a conjunction) pins the primary key to an integer literal, return it.
+fn pk_eq_literal(schema: &TableSchema, expr: &BoundExpr) -> Option<i64> {
+    let pk_idx = schema.pk_col_idx?;
+    match expr {
+        BoundExpr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => pk_eq_literal(schema, left).or_else(|| pk_eq_literal(schema, right)),
+        BoundExpr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (BoundExpr::Column(c), BoundExpr::Literal(Value::BigInt(v)))
+            | (BoundExpr::Literal(Value::BigInt(v)), BoundExpr::Column(c))
+                if *c == pk_idx =>
+            {
+                Some(*v)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Clear the mask bit of every slot that does not satisfy `expr`.
+/// Conjunctions of `column = literal` run as tight column loops.
+fn apply_where_mask(mem: &MemTable, expr: &BoundExpr, mask: &mut [u8]) -> Result<()> {
+    if let BoundExpr::Binary { left, op, right } = expr {
+        match op {
+            BinaryOp::And => {
+                apply_where_mask(mem, left, mask)?;
+                return apply_where_mask(mem, right, mask);
+            }
+            BinaryOp::Eq => match (left.as_ref(), right.as_ref()) {
+                (BoundExpr::Column(c), BoundExpr::Literal(lit))
+                | (BoundExpr::Literal(lit), BoundExpr::Column(c)) => {
+                    if mem.and_eq_mask(*c, lit, mask) {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    for slot in 0..mask.len() {
+        if mask[slot] != 0 && !eval_where(expr, &mem.row(slot as u32))? {
+            mask[slot] = 0;
+        }
+    }
+    Ok(())
+}
+
+/// `coerce_literal` for an owned literal: string payloads are moved, not copied.
+pub fn coerce_literal_owned(lit: LiteralValue, target: &DataType, is_pk: bool) -> Result<Value> {
+    if let (LiteralValue::Str(_), DataType::Varchar(max_len)) = (&lit, target) {
+        let LiteralValue::Str(s) = lit else {
+            unreachable!()
+        };
+        let chars = if s.is_ascii() { s.len() } else { s.chars().count() };
+        if chars > *max_len {
+            return Err(DbError::new(
+                ErrorCode::ValueTooLong,
+                format!("string length {} exceeds VARCHAR({})", chars, max_len),
+            ));
+        }
+        return Ok(Value::Varchar(s));
+    }
+    coerce_literal(&lit, target, is_pk)
 }
 
 fn compare_sort_entries(
@@ -1946,7 +1644,7 @@ fn infer_expr_type(schema: &TableSchema, expr: &BoundExpr) -> Result<ExprType> {
 }
 
 #[inline]
-pub fn eval_where(expr: &BoundExpr, row: &Row) -> Result<bool> {
+pub fn eval_where<R: RowAccess + ?Sized>(expr: &BoundExpr, row: &R) -> Result<bool> {
     if let BoundExpr::Binary {
         left,
         op: BinaryOp::Eq,
@@ -1956,9 +1654,9 @@ pub fn eval_where(expr: &BoundExpr, row: &Row) -> Result<bool> {
         match (left.as_ref(), right.as_ref()) {
             (BoundExpr::Column(cidx), BoundExpr::Literal(lit))
             | (BoundExpr::Literal(lit), BoundExpr::Column(cidx)) => {
-                return Ok(match (&row.values[*cidx], lit) {
-                    (Value::BigInt(a), Value::BigInt(b)) => a == b,
-                    (Value::Varchar(a), Value::Varchar(b)) => a == b,
+                return Ok(match (row.cell(*cidx), lit) {
+                    (Cell::Int(a), Value::BigInt(b)) => a == *b,
+                    (Cell::Str(a), Value::Varchar(b)) => a == b.as_str(),
                     _ => false,
                 });
             }
@@ -1971,7 +1669,7 @@ pub fn eval_where(expr: &BoundExpr, row: &Row) -> Result<bool> {
     }
 }
 
-fn eval_tri_bool(expr: &BoundExpr, row: &Row) -> Result<Option<bool>> {
+fn eval_tri_bool<R: RowAccess + ?Sized>(expr: &BoundExpr, row: &R) -> Result<Option<bool>> {
     match expr {
         BoundExpr::Not(inner) => Ok(eval_tri_bool(inner, row)?.map(|b| !b)),
         BoundExpr::IsNull { expr, negated } => {
@@ -2047,13 +1745,13 @@ enum EvalVal<'a> {
     Float(f64),
 }
 
-fn eval_scalar<'a>(expr: &'a BoundExpr, row: &'a Row) -> Result<EvalVal<'a>> {
+fn eval_scalar<'a, R: RowAccess + ?Sized>(expr: &'a BoundExpr, row: &'a R) -> Result<EvalVal<'a>> {
     match expr {
-        BoundExpr::Column(idx) => match &row.values[*idx] {
-            Value::Null => Ok(EvalVal::Null),
-            Value::BigInt(v) => Ok(EvalVal::Int(*v)),
-            Value::Varchar(s) => Ok(EvalVal::Str(s.as_str())),
-            Value::Vector(_) => Err(DbError::new(
+        BoundExpr::Column(idx) => match row.cell(*idx) {
+            Cell::Null => Ok(EvalVal::Null),
+            Cell::Int(v) => Ok(EvalVal::Int(v)),
+            Cell::Str(s) => Ok(EvalVal::Str(s)),
+            Cell::Vector(_) => Err(DbError::new(
                 ErrorCode::TypeMismatch,
                 "vector column cannot be compared directly",
             )),
@@ -2068,9 +1766,9 @@ fn eval_scalar<'a>(expr: &'a BoundExpr, row: &'a Row) -> Result<EvalVal<'a>> {
             )),
         },
         BoundExpr::FloatLiteral(f) => Ok(EvalVal::Float(*f)),
-        BoundExpr::L2Distance { col_idx, query } => match &row.values[*col_idx] {
-            Value::Null => Ok(EvalVal::Null),
-            Value::Vector(v) => Ok(EvalVal::Float(l2_distance(v, query)?)),
+        BoundExpr::L2Distance { col_idx, query } => match row.cell(*col_idx) {
+            Cell::Null => Ok(EvalVal::Null),
+            Cell::Vector(v) => Ok(EvalVal::Float(l2_distance(v, query)?)),
             _ => Err(DbError::new(
                 ErrorCode::TypeMismatch,
                 "L2_DISTANCE target is not a vector",
@@ -2083,22 +1781,22 @@ fn eval_scalar<'a>(expr: &'a BoundExpr, row: &'a Row) -> Result<EvalVal<'a>> {
     }
 }
 
-pub fn eval_sort_key(key: &BoundOrderKey, row: &Row) -> Result<SortVal> {
+pub fn eval_sort_key<R: RowAccess + ?Sized>(key: &BoundOrderKey, row: &R) -> Result<SortVal> {
     match key {
-        BoundOrderKey::Column(idx) => Ok(match &row.values[*idx] {
-            Value::Null => SortVal::Null,
-            Value::BigInt(v) => SortVal::Int(*v),
-            Value::Varchar(s) => SortVal::Str(s.clone()),
-            Value::Vector(_) => {
+        BoundOrderKey::Column(idx) => Ok(match row.cell(*idx) {
+            Cell::Null => SortVal::Null,
+            Cell::Int(v) => SortVal::Int(v),
+            Cell::Str(s) => SortVal::Str(s.to_string()),
+            Cell::Vector(_) => {
                 return Err(DbError::new(
                     ErrorCode::TypeMismatch,
                     "cannot sort by VECTOR directly",
                 ));
             }
         }),
-        BoundOrderKey::L2Distance { col_idx, query } => match &row.values[*col_idx] {
-            Value::Null => Ok(SortVal::Null),
-            Value::Vector(v) => Ok(SortVal::Float(l2_distance_squared(v, query)?)),
+        BoundOrderKey::L2Distance { col_idx, query } => match row.cell(*col_idx) {
+            Cell::Null => Ok(SortVal::Null),
+            Cell::Vector(v) => Ok(SortVal::Float(l2_distance(v, query)?)),
             _ => Err(DbError::new(
                 ErrorCode::TypeMismatch,
                 "L2_DISTANCE column is not a VECTOR",
@@ -2107,17 +1805,17 @@ pub fn eval_sort_key(key: &BoundOrderKey, row: &Row) -> Result<SortVal> {
     }
 }
 
-pub fn project_row(items: &[BoundSelectItem], row: &Row) -> Result<Vec<JsonValue>> {
+pub fn project_row<R: RowAccess + ?Sized>(items: &[BoundSelectItem], row: &R) -> Result<Vec<JsonValue>> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
             BoundSelectItem::Column { col_idx, .. } => {
-                out.push(row.values[*col_idx].to_json()?);
+                out.push(row.cell(*col_idx).to_json()?);
             }
             BoundSelectItem::L2Distance { col_idx, query, .. } => {
-                let val = match &row.values[*col_idx] {
-                    Value::Null => JsonValue::Null,
-                    Value::Vector(v) => {
+                let val = match row.cell(*col_idx) {
+                    Cell::Null => JsonValue::Null,
+                    Cell::Vector(v) => {
                         let dist = l2_distance(v, query)?;
                         let num = serde_json::Number::from_f64(dist).ok_or_else(|| {
                             DbError::new(

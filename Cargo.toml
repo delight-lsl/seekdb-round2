@@ -11,6 +11,6 @@ crc32fast = "1.5"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
