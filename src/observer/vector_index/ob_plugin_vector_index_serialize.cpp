@@ -387,6 +387,7 @@ int ObHNSWSerializeCallback::operator()(const char *data, const int64_t data_siz
   lob_param.offset_ = 0;
   lob_param.scan_backward_ = false;
   lob_param.is_total_quantity_log_ = true;
+  lob_param.try_flush_redo_ = true;
   lob_param.sql_mode_ = SMO_DEFAULT;
   lob_param.timeout_ = param.timeout_;
   lob_param.lob_common_ = nullptr;

@@ -76,6 +76,17 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
   } else {
     create_index_arg.is_inner_ = my_session->is_inner();
     create_index_arg.parallelism_ = stmt.get_parallelism();
+    if (create_index_arg.parallelism_ <= 1 &&
+        share::schema::is_vec_index(create_index_arg.index_type_) &&
+        0 != ObCharset::locate(CS_TYPE_UTF8MB4_GENERAL_CI,
+                               first_stmt.ptr(), first_stmt.length(), "cuvs", 4, 1) &&
+        0 == ObCharset::locate(CS_TYPE_UTF8MB4_GENERAL_CI,
+                               first_stmt.ptr(), first_stmt.length(), "parallel", 8, 1)) {
+      const long nprocs = ::sysconf(_SC_NPROCESSORS_ONLN);
+      if (nprocs >= 8) {
+        create_index_arg.parallelism_ = 4;
+      }
+    }
     if (OB_FAIL(index_arg_list.push_back(&create_index_arg))) {
     }
   }

@@ -963,10 +963,52 @@ int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObD
 {
   int ret = OB_SUCCESS;
   ObBatchDatumRows *datum_rows = nullptr;
-  if (OB_ISNULL(row_file) || OB_ISNULL(tablet_context)) {
+  if (OB_ISNULL(row_file) || OB_ISNULL(tablet_context) || OB_ISNULL(tablet_context->vector_index_ctx_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), KP(row_file), KP(tablet_context));
+    return ret;
   }
+
+  ObIVectorIndexRuntime *vec_index_service =
+      ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
+  ObPluginVectorIndexAdapterGuard adaptor_guard;
+  int64_t extra_info_actual_size = 0;
+  bool fast_batch = false;
+  if (extra_column_idx_types_.count() == 0 && vec_dim_ > 0 && vector_vid_col_idx_ >= 0 &&
+      vector_col_idx_ >= 0 && OB_NOT_NULL(vec_index_service)) {
+    if (OB_SUCC(vec_index_service->acquire_adapter_guard(
+            tablet_id_, ObIndexType::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL, adaptor_guard,
+            &tablet_context->vector_index_ctx_->vec_idx_param_,
+            tablet_context->vector_index_ctx_->vec_dim_)) &&
+        OB_NOT_NULL(adaptor_guard.get_adatper()) &&
+        (adaptor_guard.get_adatper()->get_snap_index_type() == VIAT_HNSW ||
+         adaptor_guard.get_adatper()->get_snap_index_type() == VIAT_HGRAPH) &&
+        OB_SUCC(adaptor_guard.get_adatper()->get_extra_info_actual_size(extra_info_actual_size)) &&
+        extra_info_actual_size == 0) {
+      fast_batch = true;
+    } else {
+      ret = OB_SUCCESS;
+    }
+  }
+
+  float *batch_vecs = nullptr;
+  int64_t *batch_vids = nullptr;
+  const int64_t BATCH_CAP = 1024;
+  if (fast_batch) {
+    batch_vecs = static_cast<float *>(
+        op_allocator_.alloc(sizeof(float) * static_cast<size_t>(BATCH_CAP * vec_dim_)));
+    batch_vids = static_cast<int64_t *>(
+        op_allocator_.alloc(sizeof(int64_t) * static_cast<size_t>(BATCH_CAP)));
+    if (OB_ISNULL(batch_vecs) || OB_ISNULL(batch_vids)) {
+      if (OB_NOT_NULL(batch_vecs)) { op_allocator_.free(batch_vecs); batch_vecs = nullptr; }
+      if (OB_NOT_NULL(batch_vids)) { op_allocator_.free(batch_vids); batch_vids = nullptr; }
+      fast_batch = false;
+    }
+  }
+
+  const int32_t expected_vec_bytes = static_cast<int32_t>(vec_dim_ * static_cast<int64_t>(sizeof(float)));
+  int64_t batch_cnt = 0;
+
   while (OB_SUCC(ret)) {
     if (OB_FAIL(row_file->get_next_batch(datum_rows))) {
       if (OB_ITER_END == ret) {
@@ -978,12 +1020,67 @@ int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObD
     } else {
       const ObArray<common::ObIVector *> &vectors = datum_rows->vectors_;
       const int64_t total_row_count = datum_rows->row_count_;
-      for (int64_t i = 0; OB_SUCC(ret) && i < total_row_count; ++i) {
-        if (OB_FAIL(append_row(i, vectors, tablet_context))) {
+      if (fast_batch && vectors.count() > vector_vid_col_idx_ && vectors.count() > vector_col_idx_) {
+        row_allocator_.reuse();
+        common::ObIVector *vid_vec = vectors.at(vector_vid_col_idx_);
+        common::ObIVector *val_vec = vectors.at(vector_col_idx_);
+        for (int64_t i = 0; OB_SUCC(ret) && i < total_row_count; ++i) {
+          if (val_vec->is_null(i)) {
+            continue;
+          }
+          int64_t vec_vid = vid_vec->get_int(i);
+          ObString vec_str = val_vec->get_string(i);
+          if (OB_FAIL(read_full_lob_string(
+                  row_allocator_, ObLongTextType, CS_TYPE_BINARY, true, vec_str))) {
+          } else if (vec_str.length() == 0) {
+          } else if (OB_UNLIKELY(vec_str.length() != expected_vec_bytes)) {
+            if (batch_cnt > 0) {
+              uint32_t dummy_len = static_cast<uint32_t>(expected_vec_bytes);
+              if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(
+                      batch_vecs, batch_vids, nullptr, 0, static_cast<int>(batch_cnt), &dummy_len))) {
+              }
+              batch_cnt = 0;
+            }
+            if (OB_SUCC(ret)) {
+              ret = append_row(i, vectors, tablet_context);
+            }
+          } else {
+            MEMCPY(batch_vecs + batch_cnt * vec_dim_, vec_str.ptr(), static_cast<size_t>(expected_vec_bytes));
+            batch_vids[batch_cnt++] = vec_vid;
+            if (batch_cnt == BATCH_CAP) {
+              uint32_t dummy_len = static_cast<uint32_t>(expected_vec_bytes);
+              if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(
+                      batch_vecs, batch_vids, nullptr, 0, static_cast<int>(batch_cnt), &dummy_len))) {
+              }
+              batch_cnt = 0;
+              row_allocator_.reuse();
+            }
+          }
+        }
+      } else {
+        if (batch_cnt > 0) {
+          uint32_t dummy_len = static_cast<uint32_t>(expected_vec_bytes);
+          if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(
+                  batch_vecs, batch_vids, nullptr, 0, static_cast<int>(batch_cnt), &dummy_len))) {
+          }
+          batch_cnt = 0;
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < total_row_count; ++i) {
+          if (OB_FAIL(append_row(i, vectors, tablet_context))) {
+          }
         }
       }
     }
   }
+
+  if (OB_SUCC(ret) && batch_cnt > 0) {
+    uint32_t dummy_len = static_cast<uint32_t>(expected_vec_bytes);
+    if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(
+            batch_vecs, batch_vids, nullptr, 0, static_cast<int>(batch_cnt), &dummy_len))) {
+    }
+  }
+  if (OB_NOT_NULL(batch_vecs)) { op_allocator_.free(batch_vecs); }
+  if (OB_NOT_NULL(batch_vids)) { op_allocator_.free(batch_vids); }
   return ret;
 }
 

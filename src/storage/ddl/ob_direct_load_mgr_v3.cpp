@@ -562,8 +562,8 @@ int ObTabletDirectLoadMgrV3::close()
         } else {
           break;
         }
+        ob_usleep(100L * 1000L);
       }
-      ob_usleep(100L * 1000L);
     }
   }
   return ret;

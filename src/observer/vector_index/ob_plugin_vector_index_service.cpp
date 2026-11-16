@@ -22,6 +22,7 @@
 #include "storage/allocator/ob_shared_memory_allocator_mgr.h"
 #include "storage/vector_type/ob_vector_common_util.h"
 #include "observer/vector_index/ob_vector_index_util.h"
+#include "lib/vector/ob_vsag_adaptor.h"
 
 namespace oceanbase
 {
@@ -881,6 +882,7 @@ int ObPluginVectorIndexService::init(schema::ObMultiVersionSchemaService *schema
       lob_read_service_ = lob_read_service;
       sql_proxy_ = GCTX.sql_proxy_;
       is_inited_ = true;
+      common::obvsag::warmup_cuvs_async();
       LOG_INFO("plugin vector index service: init", KR(ret));
     }
     if (OB_FAIL(ret) && OB_NOT_NULL(single_index_mgr_)) {

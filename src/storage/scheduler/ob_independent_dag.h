@@ -65,7 +65,7 @@ private:
   int deal_with_finish_task(ObITask *&task, const int error_code, bool &task_is_suspended);
   int deal_with_suspended_task(ObITask &task, const int error_code, bool &task_is_suspended);
 private:
-  static const int64_t DAG_COND_TIMEOUT_MS = 50L /*50ms*/;
+  static const int64_t DAG_COND_TIMEOUT_MS = 2L /*2ms*/;
   static const int64_t DAG_SCHEDULE_ONE_PRINT_INTERVAL = 60 * 1000L * 1000L /*60s*/;
   static const int64_t READY_TASK_BATCH_MOVE_SIZE = 50L;
 private:

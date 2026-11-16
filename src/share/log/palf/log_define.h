@@ -107,7 +107,7 @@ typedef common::ObFixedArray<LogWriteBuf *, ObIAllocator> LogWriteBufArray;
 // ==================== block and log end ===========================
 
 // ====================== Local log state begin =====================
-constexpr int64_t DEFAULT_GROUP_BUFFER_SIZE = 1 << 22;
+constexpr int64_t DEFAULT_GROUP_BUFFER_SIZE = 1 << 26;
 const int64_t PALF_STAT_PRINT_INTERVAL_US = 1 * 1000 * 1000L;
 const int64_t PALF_IO_STAT_PRINT_INTERVAL_US = 10 * 1000 * 1000L;
 const int64_t MATCH_LSN_ADVANCE_DELAY_THRESHOLD_US = 1 * 1000 * 1000L;

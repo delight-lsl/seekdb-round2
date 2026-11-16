@@ -10,21 +10,22 @@ int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
                           const float* query, long nq, long topk,
                           unsigned int* out_ids);
 
-/* Build-once / search-many (used by seekdb's ob_vsag_adaptor GPU path).
- *  - seekdb_cuvs_build: builds a CAGRA index on the GPU from base (n x dim,
- *    row-major f32) and returns an opaque handle (NULL on error). cuVS copies
- *    the dataset to the device, so `base` may be freed after this returns.
- *  - seekdb_cuvs_search: runs top-k search for nq queries (row-major f32, dim
- *    cols), writing uint32 row offsets to out_ids[nq*topk] and (if non-NULL) L2
- *    distances to out_dist[nq*topk]. Returns 0 on success.
- *  - seekdb_cuvs_free: releases the handle.
- * All ROCm/cuVS state lives inside the .so; seekdb only ever sees these C symbols. */
+/* Build-once / search-many (used by seekdb's ob_vsag_adaptor GPU path). */
 void* seekdb_cuvs_build(const float* base, long n, long dim);
 int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                          unsigned int* out_ids, float* out_dist);
 void  seekdb_cuvs_free(void* handle);
-int seekdb_cuvs_serialize(void* handle, const char* filename);
+int   seekdb_cuvs_serialize(void* handle, const char* filename);
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
+
+/* Zero-file in-memory compact graph snapshot API (avoids duplicate dataset & temp file I/O). */
+long  seekdb_cuvs_get_graph_degree(void* handle);
+int   seekdb_cuvs_export_graph(void* handle, unsigned int* out_graph, unsigned long bytes);
+void* seekdb_cuvs_from_graph(const float* base, long n, long dim,
+                             const unsigned int* graph, long degree);
+
+/* Optional background pre-warmup of GPU context, RMM pool, and hipVS/cuVS CAGRA kernels. */
+int   seekdb_cuvs_warmup(void);
 #ifdef __cplusplus
 }
 #endif

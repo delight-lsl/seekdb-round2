@@ -116,11 +116,26 @@ int Thread::start()
       pret = pthread_attr_setstacksize(&attr, stack_size_);
 #else
       pret = pthread_attr_setstack(&attr, stack_addr_, stack_size_);
+      if (pret != 0) {
+        const size_t fallback_sz = static_cast<size_t>(stack_size_) < 524288UL
+            ? 524288UL : static_cast<size_t>(stack_size_);
+        pret = pthread_attr_setstacksize(&attr, fallback_sz);
+      }
 #endif
     }
     if (pret == 0) {
       stop_ = false;
       pret = pthread_create(&pth_, &attr, __th_start, this);
+      if (pret != 0) {
+        pthread_attr_t fb_attr;
+        if (pthread_attr_init(&fb_attr) == 0) {
+          const size_t fb_sz = static_cast<size_t>(stack_size_) < 524288UL
+              ? 524288UL : static_cast<size_t>(stack_size_);
+          pthread_attr_setstacksize(&fb_attr, fb_sz);
+          pret = pthread_create(&pth_, &fb_attr, __th_start, this);
+          pthread_attr_destroy(&fb_attr);
+        }
+      }
       if (pret != 0) {
         LOG_ERROR("pthread create failed", K(pret), K(errno));
 #ifdef _WIN32

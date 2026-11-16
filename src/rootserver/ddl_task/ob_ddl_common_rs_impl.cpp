@@ -980,7 +980,7 @@ int ObDDLTaskUtil::check_and_cancel_single_replica_dag(
   }
   if (OB_SUCC(ret)) {
     all_dag_exit = check_dag_exit_tablets_map.empty() ? true : false;
-    task->set_delay_schedule_time(3000L * 1000L); // 3s, to avoid resubmitting local work too frequently.
+    task->set_delay_schedule_time(all_dag_exit ? 0 : (5L * 1000L));
   } else if (OB_TABLE_NOT_EXIST == ret
       || OB_RUNTIME_SCHEMA_NOT_READY == ret
       || (++check_dag_exit_retry_cnt >= 10 /*MAX RETRY COUNT IF FAILED*/)) {

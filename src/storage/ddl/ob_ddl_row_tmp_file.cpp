@@ -64,9 +64,11 @@ int ObDDLRowFile::open(const ObIArray<ObColumnSchemaItem> &all_column_schema_its
         desc.precision_ = column.col_accuracy_.get_precision();
         bdrs_.vectors_.at(i) = nullptr;
       }
+      const int64_t eff_mem_limit = std::max(memory_limit, static_cast<int64_t>(64LL * 1024 * 1024));
+      const int64_t rot_limit = std::max(memory_limit, static_cast<int64_t>(16LL * 1024 * 1024));
       options.max_batch_size_ = max_batch_size;
-      options.resident_memory_limit_ = memory_limit;
-      options.rotation_threshold_ = memory_limit;
+      options.resident_memory_limit_ = eff_mem_limit;
+      options.rotation_threshold_ = std::min(eff_mem_limit, rot_limit);
       options.dir_id_ = dir_id;
       options.compressor_type_ = NONE_COMPRESSOR;
       options.async_read_ = true;
