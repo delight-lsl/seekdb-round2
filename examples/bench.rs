@@ -67,7 +67,7 @@ fn main() {
     )
     .unwrap();
     let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
-    println!("[Bench 3] HNSW index build (10000 x 128d): {:.2} ms", idx_ms);
+    println!("[Bench 3] CREATE VECTOR INDEX (10000 x 128d): {:.2} ms", idx_ms);
 
     // 3. Section 3.3 Query workload: 500 unfiltered + 500 filtered (10% selectivity), K = 10
     let k = 10usize;

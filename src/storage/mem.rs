@@ -16,8 +16,18 @@ use std::collections::BinaryHeap;
 const STR_CHUNK: usize = 256 * 1024;
 const VEC_CHUNK_BYTES: usize = 1024 * 1024;
 const NULL_LEN: u32 = u32::MAX;
+const MAX_DICT_ENTRIES: usize = 254;
 /// Tables smaller than this are scanned directly; larger ones get quantized codes.
 const SQ_MIN_ROWS: usize = 1024;
+
+/// Reusable working buffers for vector TopK queries (avoids per-query heap allocations).
+#[derive(Debug, Default)]
+pub struct QueryScratch {
+    pub mask: Vec<u8>,
+    pub qcodes: Vec<u8>,
+    pub lbs: Vec<u32>,
+    pub sel: Vec<u32>,
+}
 
 /// 7-bit scalar-quantized copy of a vector column used as a *lower-bound* filter.
 ///
@@ -58,13 +68,14 @@ impl SqCodes {
         self.encoded += v.len();
     }
 
-    fn encode_query(&self, q: &[f32]) -> Vec<u8> {
-        let mut out = vec![0u8; self.stride];
+    #[inline]
+    fn encode_query_into(&self, q: &[f32], out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.stride, 0u8);
         for (o, &x) in out.iter_mut().zip(q.iter()) {
             let t = (x - self.lo) * self.inv_step;
             *o = t.max(0.0).min(127.0) as u8;
         }
-        out
     }
 
     fn is_stale(&self) -> bool {
@@ -87,7 +98,7 @@ const NULL_REF: StrRef = StrRef {
 
 #[inline]
 pub fn hash_bytes(b: &[u8]) -> u64 {
-    // FNV-1a with a final avalanche; only used as an equality pre-filter.
+    // FNV-1a with a final avalanche; used for dictionary lookup and overflow pre-filtering.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &c in b {
         h ^= c as u64;
@@ -96,11 +107,21 @@ pub fn hash_bytes(b: &[u8]) -> u64 {
     h ^ (h >> 29)
 }
 
+#[inline]
+fn hash_tag(b: &[u8]) -> u8 {
+    let t = hash_bytes(b) as u8;
+    if t == 0 { 1 } else { t }
+}
+
 #[derive(Debug)]
 pub struct StrCol {
     refs: Vec<StrRef>,
-    hashes: Vec<u64>,
+    /// When `!dict_overflow`: `0` = NULL, `1..=254` = exact 1-based dictionary id.
+    /// When `dict_overflow`: `0` = NULL, `1..=255` = `hash_tag(bytes)`.
+    tags: Vec<u8>,
     chunks: Vec<Vec<u8>>,
+    dict: Vec<(u64, StrRef)>,
+    dict_overflow: bool,
     live_bytes: usize,
     used_bytes: usize,
 }
@@ -109,8 +130,10 @@ impl StrCol {
     fn new() -> Self {
         Self {
             refs: Vec::new(),
-            hashes: Vec::new(),
+            tags: Vec::new(),
             chunks: Vec::new(),
+            dict: Vec::new(),
+            dict_overflow: false,
             live_bytes: 0,
             used_bytes: 0,
         }
@@ -126,7 +149,13 @@ impl StrCol {
         Some(&c[r.off as usize..r.off as usize + r.len as usize])
     }
 
-    fn store(&mut self, bytes: &[u8]) -> StrRef {
+    #[inline]
+    fn get_ref(&self, r: StrRef) -> &[u8] {
+        let c = &self.chunks[r.chunk as usize];
+        &c[r.off as usize..r.off as usize + r.len as usize]
+    }
+
+    fn store_raw(&mut self, bytes: &[u8]) -> StrRef {
         let need_new = match self.chunks.last() {
             Some(c) => c.capacity() - c.len() < bytes.len(),
             None => true,
@@ -138,7 +167,6 @@ impl StrCol {
         let c = &mut self.chunks[ci];
         let off = c.len();
         c.extend_from_slice(bytes);
-        self.live_bytes += bytes.len();
         self.used_bytes += bytes.len();
         StrRef {
             chunk: ci as u32,
@@ -150,37 +178,72 @@ impl StrCol {
     fn set(&mut self, slot: usize, val: Option<&[u8]>) {
         let old = self.refs[slot];
         if old.len != NULL_LEN {
-            self.live_bytes -= old.len as usize;
+            self.live_bytes = self.live_bytes.saturating_sub(old.len as usize);
         }
         match val {
             Some(b) => {
-                let r = self.store(b);
+                self.live_bytes += b.len();
+                if !self.dict_overflow {
+                    let h = hash_bytes(b);
+                    for (i, &(dh, dref)) in self.dict.iter().enumerate() {
+                        if dh == h && self.get_ref(dref) == b {
+                            self.refs[slot] = dref;
+                            self.tags[slot] = (i + 1) as u8;
+                            return;
+                        }
+                    }
+                    if self.dict.len() < MAX_DICT_ENTRIES {
+                        let r = self.store_raw(b);
+                        self.dict.push((h, r));
+                        self.refs[slot] = r;
+                        self.tags[slot] = self.dict.len() as u8;
+                        return;
+                    }
+                    // Exceeded 254 distinct values: switch tags to 1-byte hash fingerprints.
+                    self.dict_overflow = true;
+                    self.dict.clear();
+                    self.dict.shrink_to_fit();
+                    for s in 0..self.refs.len() {
+                        let sr = self.refs[s];
+                        self.tags[s] = if sr.len == NULL_LEN {
+                            0
+                        } else {
+                            let sb = &self.chunks[sr.chunk as usize]
+                                [sr.off as usize..sr.off as usize + sr.len as usize];
+                            hash_tag(sb)
+                        };
+                    }
+                }
+                let r = self.store_raw(b);
                 self.refs[slot] = r;
-                self.hashes[slot] = hash_bytes(b);
+                self.tags[slot] = hash_tag(b);
             }
             None => {
                 self.refs[slot] = NULL_REF;
-                self.hashes[slot] = 0;
+                self.tags[slot] = 0;
             }
         }
     }
 
     /// Rewrite the arena when more than half of it is garbage left by updates/deletes.
     fn maybe_compact(&mut self) {
-        if self.used_bytes <= self.live_bytes * 2 + STR_CHUNK * 4 {
+        if self.used_bytes <= self.live_bytes.saturating_mul(2) + STR_CHUNK * 4 {
             return;
         }
         let old_chunks = std::mem::take(&mut self.chunks);
+        self.dict.clear();
+        self.dict_overflow = false;
         self.live_bytes = 0;
         self.used_bytes = 0;
         for slot in 0..self.refs.len() {
             let r = self.refs[slot];
             if r.len == NULL_LEN {
+                self.tags[slot] = 0;
                 continue;
             }
             let src = &old_chunks[r.chunk as usize][r.off as usize..r.off as usize + r.len as usize];
-            let nr = self.store(src);
-            self.refs[slot] = nr;
+            self.refs[slot] = NULL_REF;
+            self.set(slot, Some(src));
         }
     }
 }
@@ -390,8 +453,8 @@ pub struct MemTable {
 
 impl MemTable {
     pub fn new(schema: &TableSchema) -> Self {
-        // Row id plus the row-id -> slot and primary-key -> row-id map entries.
-        let mut slot_fixed_bytes = 8 + 40;
+        // Row id plus the row-id -> slot (4 B dense) and primary-key -> row-id map entries.
+        let mut slot_fixed_bytes = 8 + 28;
         let cols = schema
             .columns
             .iter()
@@ -404,7 +467,7 @@ impl MemTable {
                     }
                 }
                 DataType::Varchar(_) => {
-                    slot_fixed_bytes += 20;
+                    slot_fixed_bytes += 13;
                     MemCol::Str(StrCol::new())
                 }
                 DataType::Vector(d) => {
@@ -483,7 +546,7 @@ impl MemTable {
                 }
                 MemCol::Str(s) => {
                     s.refs.push(NULL_REF);
-                    s.hashes.push(0);
+                    s.tags.push(0);
                 }
                 MemCol::Vector(v) => v.push_slot(),
             }
@@ -570,6 +633,55 @@ impl MemTable {
                     if b.len() != vc.dim * 4 {
                         return Err(DbError::new(ErrorCode::IoError, "stored vector dimension mismatch"));
                     }
+                    #[cfg(target_endian = "little")]
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b.as_ptr(),
+                            vc.get_mut(s).as_mut_ptr() as *mut u8,
+                            b.len(),
+                        );
+                    }
+                    #[cfg(not(target_endian = "little"))]
+                    for (d, chunk) in vc.get_mut(s).iter_mut().zip(b.chunks_exact(4)) {
+                        *d = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                    vc.mark(s, false);
+                    vc.note_max(s);
+                }
+                (MemCol::Vector(vc), RawVal::Null) => vc.mark(s, true),
+                _ => {
+                    return Err(DbError::new(ErrorCode::IoError, "stored column type mismatch"));
+                }
+            }
+            Ok(())
+        })?;
+        self.occupy(slot, rid);
+        Ok(())
+    }
+
+    /// Fast variant of `set_from_bytes` for bytes just encoded from validated in-memory UTF-8/vectors.
+    pub fn set_from_bytes_trusted(&mut self, slot: u32, rid: RowId, payload: &[u8]) -> Result<()> {
+        let s = slot as usize;
+        let cols = &mut self.cols;
+        for_each_raw_value(payload, cols.len(), |idx, raw| {
+            match (&mut cols[idx], raw) {
+                (MemCol::Int { vals, nulls }, RawVal::Int(x)) => {
+                    vals[s] = x;
+                    nulls[s] = false;
+                }
+                (MemCol::Int { nulls, .. }, RawVal::Null) => nulls[s] = true,
+                (MemCol::Str(sc), RawVal::Str(b)) => sc.set(s, Some(b)),
+                (MemCol::Str(sc), RawVal::Null) => sc.set(s, None),
+                (MemCol::Vector(vc), RawVal::Vector(b)) => {
+                    #[cfg(target_endian = "little")]
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b.as_ptr(),
+                            vc.get_mut(s).as_mut_ptr() as *mut u8,
+                            b.len(),
+                        );
+                    }
+                    #[cfg(not(target_endian = "little"))]
                     for (d, chunk) in vc.get_mut(s).iter_mut().zip(b.chunks_exact(4)) {
                         *d = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     }
@@ -678,10 +790,28 @@ impl MemTable {
             }
             (MemCol::Str(sc), Value::Varchar(x)) => {
                 let xb = x.as_bytes();
-                let h = hash_bytes(xb);
-                // Branch-free hash filter, then a byte comparison of the survivors.
-                for (m, hh) in mask.iter_mut().zip(sc.hashes.iter()) {
-                    *m &= (*hh == h) as u8;
+                if !sc.dict_overflow {
+                    let h = hash_bytes(xb);
+                    let mut code: u8 = 0;
+                    for (i, &(dh, dref)) in sc.dict.iter().enumerate() {
+                        if dh == h && sc.get_ref(dref) == xb {
+                            code = (i + 1) as u8;
+                            break;
+                        }
+                    }
+                    if code == 0 {
+                        mask.fill(0);
+                        return true;
+                    }
+                    for (m, &t) in mask.iter_mut().zip(sc.tags.iter()) {
+                        *m &= (t == code) as u8;
+                    }
+                    return true;
+                }
+                let tag = hash_tag(xb);
+                // Branch-free 1-byte fingerprint filter, then a byte comparison of the survivors.
+                for (m, &t) in mask.iter_mut().zip(sc.tags.iter()) {
+                    *m &= (t == tag) as u8;
                 }
                 for (ci, chunk) in mask.chunks_mut(8).enumerate() {
                     if chunk.iter().all(|&b| b == 0) {
@@ -699,13 +829,15 @@ impl MemTable {
         }
     }
 
-    /// Base selection mask: live rows whose vector column `col` is not NULL.
-    pub fn base_mask(&self, vec_col: Option<usize>) -> Vec<u8> {
-        let mut mask: Vec<u8> = if self.has_holes() {
-            self.rids.iter().map(|&r| (r != 0) as u8).collect()
+    /// Populate `mask` in place with the base selection mask: live rows whose vector column `col` is not NULL.
+    pub fn fill_base_mask(&self, vec_col: Option<usize>, mask: &mut Vec<u8>) {
+        let n = self.rids.len();
+        mask.clear();
+        if self.has_holes() {
+            mask.extend(self.rids.iter().map(|&r| (r != 0) as u8));
         } else {
-            vec![1u8; self.rids.len()]
-        };
+            mask.resize(n, 1u8);
+        }
         if let Some(c) = vec_col {
             if let MemCol::Vector(v) = &self.cols[c] {
                 if v.null_count > 0 {
@@ -715,27 +847,41 @@ impl MemTable {
                 }
             }
         }
+    }
+
+    /// Base selection mask: live rows whose vector column `col` is not NULL.
+    pub fn base_mask(&self, vec_col: Option<usize>) -> Vec<u8> {
+        let mut mask = Vec::new();
+        self.fill_base_mask(vec_col, &mut mask);
         mask
     }
 
     /// Exact top-k nearest rows by `(squared L2 distance in f64, primary key, row id)`.
-    ///
-    /// `mask` (when given) selects the candidate slots and must already exclude free
-    /// slots and NULL vectors; `None` means "every slot" and is only valid when the
-    /// table has no holes and the column has no NULLs.
-    ///
-    /// Large columns are scanned through the quantized lower-bound codes: a row is
-    /// skipped only if its lower bound already exceeds the current k-th best exact
-    /// distance; everything else is evaluated with the exact double-precision kernel.
-    /// Smaller columns use a single-precision SIMD pass that selects a provable superset
-    /// (rounding slack included) which is then ranked exactly. Either way the result is
-    /// identical to a full double-precision scan.
     pub fn topk_exact(
         &self,
         col: usize,
         query: &[f32],
         k: usize,
         mask: Option<&[u8]>,
+    ) -> Vec<(f64, Option<i64>, RowId, u32)> {
+        let mut scratch = QueryScratch::default();
+        let use_mask = if let Some(m) = mask {
+            scratch.mask.extend_from_slice(m);
+            true
+        } else {
+            false
+        };
+        self.topk_exact_with_scratch(col, query, k, use_mask, &mut scratch)
+    }
+
+    /// Exact top-k reusing `scratch` buffers (`scratch.mask` is read when `use_mask` is true).
+    pub fn topk_exact_with_scratch(
+        &self,
+        col: usize,
+        query: &[f32],
+        k: usize,
+        use_mask: bool,
+        scratch: &mut QueryScratch,
     ) -> Vec<(f64, Option<i64>, RowId, u32)> {
         let Some(vc) = self.vec_col(col) else {
             return Vec::new();
@@ -744,22 +890,29 @@ impl MemTable {
         if k == 0 || query.len() != vc.dim || nslots == 0 {
             return Vec::new();
         }
+        let QueryScratch {
+            ref mask,
+            ref mut qcodes,
+            ref mut lbs,
+            ref mut sel,
+        } = *scratch;
+        let mask: Option<&[u8]> = if use_mask { Some(mask.as_slice()) } else { None };
         let q_max = query.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
         let mut out: Vec<(f64, Option<i64>, RowId, u32)>;
 
         if let (Some(sq), true) = (&vc.sq, k.saturating_mul(8) <= nslots && q_max < 1e15) {
             // Pass 0: integer lower bound of every candidate row.
-            let qcodes = sq.encode_query(query);
-            let mut lbs: Vec<u32> = Vec::with_capacity(if mask.is_some() { nslots / 4 + 64 } else { nslots });
-            let mut sel: Vec<u32> = Vec::new();
+            sq.encode_query_into(query, qcodes);
+            lbs.clear();
+            sel.clear();
             let rpc = vc.rows_per_chunk;
             for (ci, codes) in sq.chunks.iter().enumerate() {
                 let first = ci * rpc;
                 let rows = codes.len() / sq.stride;
                 let m = mask.map(|m| &m[first..first + rows]);
-                sq_lower_bounds(codes, sq.stride, rows, &qcodes, m, first as u32, &mut lbs, &mut sel);
+                sq_lower_bounds(codes, sq.stride, rows, qcodes, m, first as u32, lbs, sel);
             }
-            let slot_at = |i: usize| -> u32 {
+            let slot_at = |i: usize, sel: &[u32]| -> u32 {
                 if mask.is_some() {
                     sel[i]
                 } else {
@@ -775,12 +928,12 @@ impl MemTable {
                 )
             };
             if lbs.len() <= k {
-                out = (0..lbs.len()).map(|i| exact(slot_at(i))).collect();
+                out = (0..lbs.len()).map(|i| exact(slot_at(i, sel))).collect();
             } else {
                 // Pass 1: the k rows with the smallest lower bounds give a first exact
                 // k-th distance (an upper bound of the final one).
                 let mut best: BinaryHeap<(u32, u32)> = BinaryHeap::with_capacity(k + 1);
-                scan_le(&lbs, u32::MAX, |i| {
+                scan_le(lbs, u32::MAX, |i| {
                     let item = (lbs[i], i as u32);
                     if best.len() < k {
                         best.push(item);
@@ -795,15 +948,15 @@ impl MemTable {
                 });
                 let mut kth = 0.0_f64;
                 for &(_, i) in best.iter() {
-                    kth = kth.max(exact(slot_at(i as usize)).0);
+                    kth = kth.max(exact(slot_at(i as usize, sel)).0);
                 }
                 // Pass 2: only rows whose lower bound does not exceed that distance can
                 // tie or beat it; evaluate exactly those.
                 let t = (kth / sq.safe_step_sq).floor();
                 let thr = if t >= i32::MAX as f64 { i32::MAX as u32 } else { t as u32 };
                 out = Vec::with_capacity(k * 8);
-                scan_le(&lbs, thr, |i| {
-                    out.push(exact(slot_at(i)));
+                scan_le(lbs, thr, |i| {
+                    out.push(exact(slot_at(i, sel)));
                     thr
                 });
             }

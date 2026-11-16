@@ -140,10 +140,19 @@ pub enum ExecResult {
 /// Parse a string literal such as `"[1.0, 2.5, -3]"` into finite `f32` elements.
 /// Rejects NaN, Infinity, float32 overflow, empty vectors, and malformed syntax.
 pub fn parse_vector_str(raw: &str) -> Result<Vec<f32>> {
-    if let Some(v) = parse_vector_fast(raw.as_bytes()) {
-        return Ok(v);
+    let mut out = Vec::with_capacity((raw.len() / 6).max(8));
+    parse_vector_str_into(raw, &mut out)?;
+    Ok(out)
+}
+
+/// Parse a vector string literal by appending its finite `f32` elements to `out`.
+pub fn parse_vector_str_into(raw: &str, out: &mut Vec<f32>) -> Result<()> {
+    let base = out.len();
+    if parse_vector_fast_into(raw.as_bytes(), out) {
+        return Ok(());
     }
-    parse_vector_str_slow(raw)
+    out.truncate(base);
+    parse_vector_str_slow_into(raw, out)
 }
 
 const POW10: [f64; 23] = [
@@ -185,9 +194,9 @@ fn parse_8_digits(mut v: u64) -> u64 {
 ///   single-precision rounding boundary, so the resulting `f32` is identical;
 /// * every other token (exponent form, longer mantissa, explicit '+', ...) goes through
 ///   the standard library parser.
-/// A literal this scanner cannot fully validate returns `None`, and the caller falls
+/// A literal this scanner cannot fully validate returns `false`, and the caller falls
 /// back to the general implementation (which also produces the error messages).
-fn parse_vector_fast(b: &[u8]) -> Option<Vec<f32>> {
+fn parse_vector_fast_into(b: &[u8], out: &mut Vec<f32>) -> bool {
     let mut start = 0;
     let mut end = b.len();
     while start < end && is_plain_ws(b[start]) {
@@ -197,12 +206,11 @@ fn parse_vector_fast(b: &[u8]) -> Option<Vec<f32>> {
         end -= 1;
     }
     if end - start < 2 || b[start] != b'[' || b[end - 1] != b']' {
-        return None;
+        return false;
     }
     let s = &b[start + 1..end - 1];
     let n = s.len();
-    let commas = s.iter().filter(|&&c| c == b',').count();
-    let mut out: Vec<f32> = Vec::with_capacity(commas + 1);
+    out.reserve((n / 6).max(8));
     let mut i = 0usize;
     loop {
         while i < n && is_plain_ws(s[i]) {
@@ -276,7 +284,7 @@ fn parse_vector_fast(b: &[u8]) -> Option<Vec<f32>> {
                 let mut j = simple_end;
                 while j < n && s[j] != b',' {
                     if s[j] >= 0x80 {
-                        return None;
+                        return false;
                     }
                     j += 1;
                 }
@@ -285,19 +293,23 @@ fn parse_vector_fast(b: &[u8]) -> Option<Vec<f32>> {
                     tok_end -= 1;
                 }
                 if tok_end == tok_start {
-                    return None;
+                    return false;
                 }
-                let tok = std::str::from_utf8(&s[tok_start..tok_end]).ok()?;
+                let Ok(tok) = std::str::from_utf8(&s[tok_start..tok_end]) else {
+                    return false;
+                };
                 i = j;
-                let val = tok.parse::<f64>().ok()?;
+                let Ok(val) = tok.parse::<f64>() else {
+                    return false;
+                };
                 if !val.is_finite() {
-                    return None;
+                    return false;
                 }
                 val as f32
             }
         };
         if !f.is_finite() {
-            return None;
+            return false;
         }
         out.push(f);
         if i == n {
@@ -306,10 +318,10 @@ fn parse_vector_fast(b: &[u8]) -> Option<Vec<f32>> {
         // s[i] == b','
         i += 1;
     }
-    Some(out)
+    true
 }
 
-fn parse_vector_str_slow(raw: &str) -> Result<Vec<f32>> {
+fn parse_vector_str_slow_into(raw: &str, result: &mut Vec<f32>) -> Result<()> {
     let s = raw.trim();
     if !s.starts_with('[') || !s.ends_with(']') {
         return Err(DbError::new(
@@ -325,7 +337,7 @@ fn parse_vector_str_slow(raw: &str) -> Result<Vec<f32>> {
         ));
     }
     let est_dim = inner.bytes().filter(|&b| b == b',').count() + 1;
-    let mut result = Vec::with_capacity(est_dim);
+    result.reserve(est_dim);
     for part in inner.split(',') {
         let token = part.trim();
         if token.is_empty() {
@@ -355,18 +367,25 @@ fn parse_vector_str_slow(raw: &str) -> Result<Vec<f32>> {
         }
         result.push(val_f32);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Convert raw f64 slice (from bracket syntax) to finite `Vec<f32>`.
 pub fn validate_f64_slice_as_f32(vals: &[f64]) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(vals.len());
+    validate_f64_slice_as_f32_into(vals, &mut out)?;
+    Ok(out)
+}
+
+/// Append validated finite `f32` values from `vals` into `out`.
+pub fn validate_f64_slice_as_f32_into(vals: &[f64], out: &mut Vec<f32>) -> Result<()> {
     if vals.is_empty() {
         return Err(DbError::new(
             ErrorCode::InvalidVector,
             "vector literal cannot be empty",
         ));
     }
-    let mut out = Vec::with_capacity(vals.len());
+    out.reserve(vals.len());
     for &v in vals {
         if !v.is_finite() {
             return Err(DbError::new(
@@ -383,5 +402,5 @@ pub fn validate_f64_slice_as_f32(vals: &[f64]) -> Result<Vec<f32>> {
         }
         out.push(f);
     }
-    Ok(out)
+    Ok(())
 }

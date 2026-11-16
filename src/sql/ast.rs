@@ -1,11 +1,12 @@
 use crate::catalog::schema::ColumnSchema;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum LiteralValue {
+pub enum LiteralValue<'a> {
     Null,
     Int(i64),
     Float(f64),
-    Str(String),
+    Str(Cow<'a, str>),
     Vector(Vec<f64>),
 }
 
@@ -22,33 +23,33 @@ pub enum BinaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum Expr<'a> {
     Column(String),
-    Literal(LiteralValue),
+    Literal(LiteralValue<'a>),
     L2Distance {
         column: String,
-        query: QueryVector,
+        query: QueryVector<'a>,
     },
-    UnaryNot(Box<Expr>),
+    UnaryNot(Box<Expr<'a>>),
     IsNull {
-        expr: Box<Expr>,
+        expr: Box<Expr<'a>>,
         negated: bool,
     },
     Binary {
-        left: Box<Expr>,
+        left: Box<Expr<'a>>,
         op: BinaryOp,
-        right: Box<Expr>,
+        right: Box<Expr<'a>>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum QueryVector {
-    Text(String),
+pub enum QueryVector<'a> {
+    Text(Cow<'a, str>),
     Numbers(Vec<f64>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SelectItem {
+pub enum SelectItem<'a> {
     Wildcard,
     Column {
         name: String,
@@ -56,28 +57,28 @@ pub enum SelectItem {
     },
     L2Distance {
         column: String,
-        query: QueryVector,
+        query: QueryVector<'a>,
         alias: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum OrderByTarget {
+pub enum OrderByTarget<'a> {
     ColumnOrAlias(String),
     L2Distance {
         column: String,
-        query: QueryVector,
+        query: QueryVector<'a>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct OrderByItem {
-    pub target: OrderByTarget,
+pub struct OrderByItem<'a> {
+    pub target: OrderByTarget<'a>,
     pub asc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Statement {
+pub enum Statement<'a> {
     CreateTable {
         name: String,
         columns: Vec<ColumnSchema>,
@@ -90,23 +91,23 @@ pub enum Statement {
     Insert {
         table_name: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<LiteralValue>>,
+        rows: Vec<Vec<LiteralValue<'a>>>,
     },
     Select {
-        items: Vec<SelectItem>,
+        items: Vec<SelectItem<'a>>,
         table_name: String,
-        where_clause: Option<Expr>,
-        order_by: Vec<OrderByItem>,
+        where_clause: Option<Expr<'a>>,
+        order_by: Vec<OrderByItem<'a>>,
         limit: Option<usize>,
     },
     Update {
         table_name: String,
-        assignments: Vec<(String, LiteralValue)>,
-        where_clause: Option<Expr>,
+        assignments: Vec<(String, LiteralValue<'a>)>,
+        where_clause: Option<Expr<'a>>,
     },
     Delete {
         table_name: String,
-        where_clause: Option<Expr>,
+        where_clause: Option<Expr<'a>>,
     },
     Begin,
     Commit,

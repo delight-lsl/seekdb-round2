@@ -13,7 +13,7 @@ use crate::sql::ast::{
 };
 use crate::sql::parser::Parser;
 use crate::storage::engine::{mem_budget_bytes, pk_of_row, GroupEnd, StorageEngine};
-use crate::storage::mem::MemTable;
+use crate::storage::mem::{MemTable, QueryScratch};
 use crate::transaction::manager::TransactionManager;
 use crate::transaction::operation::WalOp;
 use crate::vector::distance::{l2_distance, l2_distance_squared};
@@ -96,6 +96,7 @@ pub struct Database {
     pub storage: StorageEngine,
     pub wal: WalManager,
     pub txn_mgr: TransactionManager,
+    pub query_scratch: QueryScratch,
 }
 
 impl Database {
@@ -107,6 +108,7 @@ impl Database {
             storage,
             wal,
             txn_mgr: TransactionManager::new(),
+            query_scratch: QueryScratch::default(),
         })
     }
 
@@ -412,10 +414,19 @@ impl Database {
         &mut self,
         table_name: &str,
         col_names: Option<&[String]>,
-        raw_rows: Vec<Vec<LiteralValue>>,
+        raw_rows: Vec<Vec<LiteralValue<'_>>>,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         let col_mapping = resolve_insert_columns(&schema, col_names)?;
+
+        if self.txn_mgr.active.is_none() {
+            let count = self
+                .storage
+                .get_table_mut(schema.table_id)?
+                .insert_autocommit_raw(&col_mapping, &raw_rows)?;
+            self.after_write(Some(schema.table_id))?;
+            return Ok(ExecResult::AffectedRows(count));
+        }
 
         let mut prepared_rows = Vec::with_capacity(raw_rows.len());
         let mut batch_pks = HashSet::with_capacity(raw_rows.len());
@@ -582,8 +593,8 @@ impl Database {
     fn exec_update(
         &mut self,
         table_name: &str,
-        assignments: &[(String, LiteralValue)],
-        where_clause: Option<&Expr>,
+        assignments: &[(String, LiteralValue<'_>)],
+        where_clause: Option<&Expr<'_>>,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         if assignments.is_empty() {
@@ -694,7 +705,7 @@ impl Database {
     fn exec_delete(
         &mut self,
         table_name: &str,
-        where_clause: Option<&Expr>,
+        where_clause: Option<&Expr<'_>>,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         let bound_where = match where_clause {
@@ -751,9 +762,9 @@ impl Database {
     fn exec_select(
         &mut self,
         table_name: &str,
-        items: &[SelectItem],
-        where_clause: Option<&Expr>,
-        order_by: &[OrderByItem],
+        items: &[SelectItem<'_>],
+        where_clause: Option<&Expr<'_>>,
+        order_by: &[OrderByItem<'_>],
         limit: Option<usize>,
         _search_mode: SearchMode,
     ) -> Result<ExecResult> {
@@ -1047,29 +1058,29 @@ impl Database {
             .and_then(|t| t.table_writes.get(&tid));
 
         let mut merged: Vec<(f64, Option<i64>, RowId, Winner<'_>)> = Vec::new();
+        let scratch = &mut self.query_scratch;
 
         if let Some(dt) = self.storage.tables.get(&tid) {
             if let Some(mem) = dt.mem() {
                 let vec_has_nulls = mem.vec_col(col_idx).map_or(true, |v| v.null_count > 0);
                 let need_mask =
                     where_expr.is_some() || tws_opt.is_some() || mem.has_holes() || vec_has_nulls;
-                let mask = if need_mask {
-                    let mut m = mem.base_mask(Some(col_idx));
+                if need_mask {
+                    mem.fill_base_mask(Some(col_idx), &mut scratch.mask);
                     if let Some(expr) = where_expr {
-                        apply_where_mask(mem, expr, &mut m)?;
+                        apply_where_mask(mem, expr, &mut scratch.mask)?;
                     }
                     if let Some(tws) = tws_opt {
                         for rid in tws.deletes.keys().chain(tws.puts.keys()) {
                             if let Some(slot) = dt.slot_of(*rid) {
-                                m[slot as usize] = 0;
+                                scratch.mask[slot as usize] = 0;
                             }
                         }
                     }
-                    Some(m)
-                } else {
-                    None
-                };
-                for (d, pk, rid, slot) in mem.topk_exact(col_idx, query, k, mask.as_deref()) {
+                }
+                for (d, pk, rid, slot) in
+                    mem.topk_exact_with_scratch(col_idx, query, k, need_mask, scratch)
+                {
                     merged.push((d, pk, rid, Winner::Slot(mem, slot)));
                 }
             } else {
@@ -1217,7 +1228,7 @@ fn apply_where_mask(mem: &MemTable, expr: &BoundExpr, mask: &mut [u8]) -> Result
 }
 
 /// `coerce_literal` for an owned literal: string payloads are moved, not copied.
-pub fn coerce_literal_owned(lit: LiteralValue, target: &DataType, is_pk: bool) -> Result<Value> {
+pub fn coerce_literal_owned(lit: LiteralValue<'_>, target: &DataType, is_pk: bool) -> Result<Value> {
     if let (LiteralValue::Str(_), DataType::Varchar(max_len)) = (&lit, target) {
         let LiteralValue::Str(s) = lit else {
             unreachable!()
@@ -1229,7 +1240,7 @@ pub fn coerce_literal_owned(lit: LiteralValue, target: &DataType, is_pk: bool) -
                 format!("string length {} exceeds VARCHAR({})", chars, max_len),
             ));
         }
-        return Ok(Value::Varchar(s));
+        return Ok(Value::Varchar(s.into_owned()));
     }
     coerce_literal(&lit, target, is_pk)
 }
@@ -1304,7 +1315,7 @@ pub fn resolve_insert_columns(
     }
 }
 
-pub fn coerce_literal(lit: &LiteralValue, target: &DataType, is_pk: bool) -> Result<Value> {
+pub fn coerce_literal(lit: &LiteralValue<'_>, target: &DataType, is_pk: bool) -> Result<Value> {
     if matches!(lit, LiteralValue::Null) {
         if is_pk {
             return Err(DbError::new(
@@ -1324,17 +1335,14 @@ pub fn coerce_literal(lit: &LiteralValue, target: &DataType, is_pk: bool) -> Res
         },
         DataType::Varchar(max_len) => match lit {
             LiteralValue::Str(s) => {
-                if s.chars().count() > *max_len {
+                let chars = if s.is_ascii() { s.len() } else { s.chars().count() };
+                if chars > *max_len {
                     return Err(DbError::new(
                         ErrorCode::ValueTooLong,
-                        format!(
-                            "string length {} exceeds VARCHAR({})",
-                            s.chars().count(),
-                            max_len
-                        ),
+                        format!("string length {} exceeds VARCHAR({})", chars, max_len),
                     ));
                 }
-                Ok(Value::Varchar(s.clone()))
+                Ok(Value::Varchar(s.as_ref().to_string()))
             }
             _ => Err(DbError::new(
                 ErrorCode::TypeMismatch,
@@ -1343,7 +1351,7 @@ pub fn coerce_literal(lit: &LiteralValue, target: &DataType, is_pk: bool) -> Res
         },
         DataType::Vector(dim) => {
             let vec = match lit {
-                LiteralValue::Str(s) => parse_vector_str(s)?,
+                LiteralValue::Str(s) => parse_vector_str(s.as_ref())?,
                 LiteralValue::Vector(v) => validate_f64_slice_as_f32(v)?,
                 _ => {
                     return Err(DbError::new(
@@ -1370,7 +1378,7 @@ pub fn coerce_literal(lit: &LiteralValue, target: &DataType, is_pk: bool) -> Res
 pub fn parse_query_vector(
     schema: &TableSchema,
     col_name: &str,
-    q: &QueryVector,
+    q: &QueryVector<'_>,
 ) -> Result<(usize, Vec<f32>)> {
     let (col_idx, col_schema) = schema.find_column(col_name).ok_or_else(|| {
         DbError::new(
@@ -1388,7 +1396,7 @@ pub fn parse_query_vector(
         }
     };
     let vec = match q {
-        QueryVector::Text(s) => parse_vector_str(s)?,
+        QueryVector::Text(s) => parse_vector_str(s.as_ref())?,
         QueryVector::Numbers(v) => validate_f64_slice_as_f32(v)?,
     };
     if vec.len() != expected_dim {
@@ -1406,7 +1414,7 @@ pub fn parse_query_vector(
 
 fn bind_select_items(
     schema: &TableSchema,
-    items: &[SelectItem],
+    items: &[SelectItem<'_>],
 ) -> Result<(Vec<BoundSelectItem>, HashMap<String, BoundOrderKey>)> {
     let mut out = Vec::new();
     let mut alias_map = HashMap::new();
@@ -1465,7 +1473,7 @@ fn bind_select_items(
 
 fn bind_order_by(
     schema: &TableSchema,
-    items: &[OrderByItem],
+    items: &[OrderByItem<'_>],
     alias_map: &HashMap<String, BoundOrderKey>,
 ) -> Result<Vec<(BoundOrderKey, bool)>> {
     let mut out = Vec::with_capacity(items.len());
@@ -1503,7 +1511,7 @@ fn bind_order_by(
     Ok(out)
 }
 
-pub fn bind_where_expr(schema: &TableSchema, expr: &Expr) -> Result<BoundExpr> {
+pub fn bind_where_expr(schema: &TableSchema, expr: &Expr<'_>) -> Result<BoundExpr> {
     let bound = bind_expr_inner(schema, expr)?;
     let ty = infer_expr_type(schema, &bound)?;
     if ty != ExprType::Bool {
@@ -1525,7 +1533,7 @@ enum ExprType {
     Null,
 }
 
-fn bind_expr_inner(schema: &TableSchema, expr: &Expr) -> Result<BoundExpr> {
+fn bind_expr_inner(schema: &TableSchema, expr: &Expr<'_>) -> Result<BoundExpr> {
     match expr {
         Expr::Column(name) => {
             let (idx, _) = schema.find_column(name).ok_or_else(|| {
@@ -1539,7 +1547,7 @@ fn bind_expr_inner(schema: &TableSchema, expr: &Expr) -> Result<BoundExpr> {
         Expr::Literal(lit) => match lit {
             LiteralValue::Null => Ok(BoundExpr::Literal(Value::Null)),
             LiteralValue::Int(i) => Ok(BoundExpr::Literal(Value::BigInt(*i))),
-            LiteralValue::Str(s) => Ok(BoundExpr::Literal(Value::Varchar(s.clone()))),
+            LiteralValue::Str(s) => Ok(BoundExpr::Literal(Value::Varchar(s.as_ref().to_string()))),
             LiteralValue::Vector(v) => Ok(BoundExpr::Literal(Value::Vector(
                 validate_f64_slice_as_f32(v)?,
             ))),

@@ -1,14 +1,20 @@
 use crate::catalog::manager::Catalog;
 use crate::catalog::schema::TableSchema;
 use crate::common::error::{DbError, ErrorCode, Result};
-use crate::common::types::{Cell, Row, RowAccess, RowId, TableId, TxnId, Value};
+use crate::common::types::{
+    parse_vector_str_into, validate_f64_slice_as_f32_into, Cell, DataType, Row, RowAccess, RowId,
+    TableId, TxnId, Value,
+};
+use crate::sql::ast::LiteralValue;
 use crate::storage::codec::{
     decode_row_selective, decode_schema, encode_row, encode_schema, extract_pk_from_row_bytes,
-    write_u32, write_u64, Cursor,
+    write_f32_slice, write_i64, write_str, write_u16, write_u32, write_u64, write_u8, Cursor,
 };
 use crate::storage::file::{atomic_write_file, sync_dir, TableDataFile};
 use crate::storage::mem::{MemTable, SlotRef};
-use crate::storage::record::{begin_data_frame, finish_data_frame, DataRecordOp};
+use crate::storage::record::{
+    begin_data_frame, finish_data_frame, DataRecordOp, DATA_HEADER_LEN, DATA_TRAILER_LEN,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -86,6 +92,74 @@ impl Hasher for IdHasher {
 }
 
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+pub type FastSet<K> = HashSet<K, BuildHasherDefault<IdHasher>>;
+
+const NO_SLOT: u32 = u32::MAX;
+
+/// Compact `RowId -> slot` mapping using a flat `u32` array for dense row ids (`1..=N`)
+/// with a sparse hash fallback for non-contiguous ids.
+#[derive(Debug, Default)]
+pub struct SlotMap {
+    dense: Vec<u32>,
+    sparse: FastMap<RowId, u32>,
+}
+
+impl SlotMap {
+    #[inline]
+    pub fn get(&self, rid: RowId) -> Option<u32> {
+        let idx = rid.wrapping_sub(1) as usize;
+        if idx < self.dense.len() {
+            let s = self.dense[idx];
+            if s != NO_SLOT {
+                Some(s)
+            } else {
+                None
+            }
+        } else if !self.sparse.is_empty() {
+            self.sparse.get(&rid).copied()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, rid: RowId) -> bool {
+        self.get(rid).is_some()
+    }
+
+    #[inline]
+    pub fn insert(&mut self, rid: RowId, slot: u32) {
+        let idx = rid.wrapping_sub(1) as usize;
+        if idx <= self.dense.len() + 4096 {
+            if idx >= self.dense.len() {
+                if self.dense.capacity() == 0 {
+                    self.dense.reserve(256);
+                }
+                self.dense.resize(idx + 1, NO_SLOT);
+            }
+            self.dense[idx] = slot;
+        } else {
+            self.sparse.insert(rid, slot);
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, rid: RowId) -> Option<u32> {
+        let idx = rid.wrapping_sub(1) as usize;
+        if idx < self.dense.len() {
+            let old = std::mem::replace(&mut self.dense[idx], NO_SLOT);
+            if old != NO_SLOT {
+                Some(old)
+            } else {
+                None
+            }
+        } else if !self.sparse.is_empty() {
+            self.sparse.remove(&rid)
+        } else {
+            None
+        }
+    }
+}
 
 /// How a transaction's frame group in a table file is terminated.
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +176,7 @@ pub enum RowStore {
     /// Whole table in the columnar memory image; `slots` maps row id -> slot.
     Mem {
         mem: MemTable,
-        slots: FastMap<RowId, u32>,
+        slots: SlotMap,
     },
     /// Table larger than the memory budget: only frame locations are kept on heap.
     Disk {
@@ -142,6 +216,14 @@ impl LiveRow<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RawCell<'a> {
+    Null,
+    Int(i64),
+    Str(&'a str),
+    VecRange(usize, usize),
+}
+
 /// Storage for a single table: an append-only commit-log data file plus either a
 /// full in-memory columnar image or (beyond the memory budget) a location index.
 #[derive(Debug)]
@@ -155,6 +237,7 @@ pub struct DiskTable {
     /// Row frames (puts + tombstones) currently in the file.
     pub total_frames: u64,
     scratch: Vec<u8>,
+    vec_scratch: Vec<f32>,
 }
 
 impl DiskTable {
@@ -191,7 +274,7 @@ impl DiskTable {
 
         let mut pk_index: FastMap<i64, RowId> = FastMap::default();
         let mut mem = MemTable::new(&schema);
-        let mut slots: FastMap<RowId, u32> = FastMap::default();
+        let mut slots = SlotMap::default();
         let mut locations: FastMap<RowId, (u64, u32)> = FastMap::default();
         let mut disk_pks: FastMap<RowId, i64> = FastMap::default();
         let mut max_row_id = 0_u64;
@@ -230,8 +313,8 @@ impl DiskTable {
                             match gop {
                                 DataRecordOp::Put => {
                                     let bytes = &gbuf[a as usize..a as usize + b as usize];
-                                    let slot = match slots.get(&grid) {
-                                        Some(&s) => {
+                                    let slot = match slots.get(grid) {
+                                        Some(s) => {
                                             if let Some(old_pk) = mem.pk(s) {
                                                 if pk_index.get(&old_pk) == Some(&grid) {
                                                     pk_index.remove(&old_pk);
@@ -251,7 +334,7 @@ impl DiskTable {
                                     }
                                 }
                                 _ => {
-                                    if let Some(s) = slots.remove(&grid) {
+                                    if let Some(s) = slots.remove(grid) {
                                         if let Some(old_pk) = mem.pk(s) {
                                             if pk_index.get(&old_pk) == Some(&grid) {
                                                 pk_index.remove(&old_pk);
@@ -316,6 +399,7 @@ impl DiskTable {
             store,
             total_frames,
             scratch: Vec::new(),
+            vec_scratch: Vec::new(),
         })
     }
 
@@ -345,7 +429,7 @@ impl DiskTable {
 
     pub fn contains_row(&self, row_id: RowId) -> bool {
         match &self.store {
-            RowStore::Mem { slots, .. } => slots.contains_key(&row_id),
+            RowStore::Mem { slots, .. } => slots.contains_key(row_id),
             RowStore::Disk { locations } => locations.contains_key(&row_id),
         }
     }
@@ -360,7 +444,7 @@ impl DiskTable {
     #[inline]
     pub fn slot_of(&self, row_id: RowId) -> Option<u32> {
         match &self.store {
-            RowStore::Mem { slots, .. } => slots.get(&row_id).copied(),
+            RowStore::Mem { slots, .. } => slots.get(row_id),
             RowStore::Disk { .. } => None,
         }
     }
@@ -371,8 +455,8 @@ impl DiskTable {
         F: FnOnce(LiveRow<'_>) -> Result<T>,
     {
         match &self.store {
-            RowStore::Mem { mem, slots } => match slots.get(&row_id) {
-                Some(&slot) => Ok(Some(f(LiveRow::Mem(mem.row(slot), mem, slot))?)),
+            RowStore::Mem { mem, slots } => match slots.get(row_id) {
+                Some(slot) => Ok(Some(f(LiveRow::Mem(mem.row(slot), mem, slot))?)),
                 None => Ok(None),
             },
             RowStore::Disk { locations } => match locations.get(&row_id) {
@@ -533,7 +617,7 @@ impl DiskTable {
         let mut max_rid = 0;
         match &mut self.store {
             RowStore::Mem { mem, slots } => {
-                for (rid, _) in deletes {
+                for &(rid, _) in deletes {
                     if let Some(slot) = slots.remove(rid) {
                         mem.free_slot(slot);
                     }
@@ -541,8 +625,8 @@ impl DiskTable {
                 let churn = !deletes.is_empty();
                 let mut updated = false;
                 for (rid, _, row) in &puts {
-                    let slot = match slots.get(rid) {
-                        Some(&s) => {
+                    let slot = match slots.get(*rid) {
+                        Some(s) => {
                             updated = true;
                             s
                         }
@@ -581,6 +665,225 @@ impl DiskTable {
         }
         self.next_row_id = self.next_row_id.max(max_rid + 1);
         Ok(())
+    }
+
+    /// Validate, encode, persist, and publish an auto-commit `INSERT` batch without
+    /// allocating intermediate `Row`, `String`, or `Vec<f32>` objects per row.
+    pub fn insert_autocommit_raw(
+        &mut self,
+        col_mapping: &[usize],
+        raw_rows: &[Vec<LiteralValue<'_>>],
+    ) -> Result<usize> {
+        let count = raw_rows.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let num_cols = self.schema.columns.len();
+        let pk_col = self.schema.pk_col_idx;
+        let disk = !self.is_mem();
+        let base = self.file.len();
+
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        let mut vec_scratch = std::mem::take(&mut self.vec_scratch);
+        vec_scratch.clear();
+
+        let mut staged: Vec<(RowId, Option<i64>, usize, u32)> = Vec::with_capacity(count);
+        let mut batch_pks: FastSet<i64> =
+            FastSet::with_capacity_and_hasher(count, Default::default());
+        let mut row_cells: Vec<RawCell<'_>> = vec![RawCell::Null; num_cols];
+        let mut next_rid = self.next_row_id;
+
+        let res: Result<()> = (|| {
+            for raw_vals in raw_rows {
+                if raw_vals.len() != col_mapping.len() {
+                    return Err(DbError::new(
+                        ErrorCode::SyntaxError,
+                        format!(
+                            "column count mismatch: expected {}, got {}",
+                            col_mapping.len(),
+                            raw_vals.len()
+                        ),
+                    ));
+                }
+                row_cells.fill(RawCell::Null);
+                vec_scratch.clear();
+
+                for (lit, &col_idx) in raw_vals.iter().zip(col_mapping.iter()) {
+                    let col_schema = &self.schema.columns[col_idx];
+                    if matches!(lit, LiteralValue::Null) {
+                        if col_schema.is_primary_key {
+                            return Err(DbError::new(
+                                ErrorCode::TypeMismatch,
+                                "PRIMARY KEY column cannot be NULL",
+                            ));
+                        }
+                        row_cells[col_idx] = RawCell::Null;
+                        continue;
+                    }
+                    row_cells[col_idx] = match &col_schema.data_type {
+                        DataType::BigInt => match lit {
+                            LiteralValue::Int(i) => RawCell::Int(*i),
+                            _ => {
+                                return Err(DbError::new(
+                                    ErrorCode::TypeMismatch,
+                                    "expected BIGINT integer literal",
+                                ))
+                            }
+                        },
+                        DataType::Varchar(max_len) => match lit {
+                            LiteralValue::Str(s) => {
+                                let sr = s.as_ref();
+                                let chars = if sr.is_ascii() {
+                                    sr.len()
+                                } else {
+                                    sr.chars().count()
+                                };
+                                if chars > *max_len {
+                                    return Err(DbError::new(
+                                        ErrorCode::ValueTooLong,
+                                        format!(
+                                            "string length {} exceeds VARCHAR({})",
+                                            chars, max_len
+                                        ),
+                                    ));
+                                }
+                                RawCell::Str(sr)
+                            }
+                            _ => {
+                                return Err(DbError::new(
+                                    ErrorCode::TypeMismatch,
+                                    "expected VARCHAR string literal",
+                                ))
+                            }
+                        },
+                        DataType::Vector(dim) => {
+                            let vstart = vec_scratch.len();
+                            match lit {
+                                LiteralValue::Str(s) => {
+                                    parse_vector_str_into(s.as_ref(), &mut vec_scratch)?
+                                }
+                                LiteralValue::Vector(v) => {
+                                    validate_f64_slice_as_f32_into(v, &mut vec_scratch)?
+                                }
+                                _ => {
+                                    return Err(DbError::new(
+                                        ErrorCode::InvalidVector,
+                                        "expected VECTOR literal",
+                                    ))
+                                }
+                            }
+                            let actual_dim = vec_scratch.len() - vstart;
+                            if actual_dim != *dim {
+                                return Err(DbError::new(
+                                    ErrorCode::DimensionMismatch,
+                                    format!(
+                                        "vector dimension mismatch: expected {}, got {}",
+                                        dim, actual_dim
+                                    ),
+                                ));
+                            }
+                            RawCell::VecRange(vstart, vec_scratch.len())
+                        }
+                    };
+                }
+
+                let row_pk = if let Some(pk_idx) = pk_col {
+                    match row_cells[pk_idx] {
+                        RawCell::Int(pk) => {
+                            if self.pk_index.contains_key(&pk) || !batch_pks.insert(pk) {
+                                return Err(DbError::new(
+                                    ErrorCode::DuplicateKey,
+                                    format!("duplicate primary key: {}", pk),
+                                ));
+                            }
+                            Some(pk)
+                        }
+                        _ => {
+                            return Err(DbError::new(
+                                ErrorCode::TypeMismatch,
+                                "primary key cannot be NULL",
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let fstart = begin_data_frame(DataRecordOp::Put, next_rid, &mut buf);
+                write_u16(&mut buf, num_cols as u16);
+                for cell in &row_cells {
+                    match *cell {
+                        RawCell::Null => write_u8(&mut buf, 0),
+                        RawCell::Int(v) => {
+                            write_u8(&mut buf, 1);
+                            write_i64(&mut buf, v);
+                        }
+                        RawCell::Str(s) => {
+                            write_u8(&mut buf, 2);
+                            write_str(&mut buf, s)?;
+                        }
+                        RawCell::VecRange(vs, ve) => {
+                            write_u8(&mut buf, 3);
+                            write_u32(&mut buf, (ve - vs) as u32);
+                            write_f32_slice(&mut buf, &vec_scratch[vs..ve]);
+                        }
+                    }
+                }
+                let flen = finish_data_frame(fstart, &mut buf)?;
+                staged.push((next_rid, row_pk, fstart, flen));
+                next_rid += 1;
+            }
+
+            let cstart = begin_data_frame(DataRecordOp::Commit, 0, &mut buf);
+            if buf.len() >= 16 * 1024 {
+                let end = base as usize + buf.len() + 4;
+                let pad = (4096 - end % 4096) % 4096;
+                buf.resize(buf.len() + pad, 0);
+            }
+            finish_data_frame(cstart, &mut buf)?;
+            self.file.commit_append(&buf, !disk)?;
+            Ok(())
+        })();
+
+        if vec_scratch.capacity() <= 64 * 1024 {
+            self.vec_scratch = vec_scratch;
+        }
+        if let Err(e) = res {
+            if buf.capacity() <= 4 * 1024 * 1024 {
+                self.scratch = buf;
+            }
+            return Err(e);
+        }
+
+        match &mut self.store {
+            RowStore::Mem { mem, slots } => {
+                for &(rid, pk, fstart, flen) in &staged {
+                    let slot = mem.alloc_slot();
+                    slots.insert(rid, slot);
+                    let payload =
+                        &buf[fstart + DATA_HEADER_LEN..fstart + flen as usize - DATA_TRAILER_LEN];
+                    mem.set_from_bytes_trusted(slot, rid, payload)?;
+                    if let Some(p) = pk {
+                        self.pk_index.insert(p, rid);
+                    }
+                }
+            }
+            RowStore::Disk { locations } => {
+                for &(rid, pk, fstart, flen) in &staged {
+                    locations.insert(rid, (base + fstart as u64, flen));
+                    if let Some(p) = pk {
+                        self.pk_index.insert(p, rid);
+                    }
+                }
+            }
+        }
+        if buf.capacity() <= 4 * 1024 * 1024 {
+            self.scratch = buf;
+        }
+        self.total_frames += staged.len() as u64;
+        self.next_row_id = next_rid;
+        Ok(count)
     }
 
     /// Give up the in-memory image and serve this table from its file.

@@ -5,30 +5,34 @@ use crate::sql::ast::{
     BinaryOp, Expr, LiteralValue, OrderByItem, OrderByTarget, QueryVector, SelectItem, Statement,
 };
 use crate::sql::lexer::{Lexer, Token};
+use std::borrow::Cow;
 
 /// Recursive-descent SQL parser producing `Statement` AST nodes.
-pub struct Parser {
-    tokens: Vec<Token>,
+pub struct Parser<'a> {
+    tokens: Vec<Token<'a>>,
     pos: usize,
 }
 
-impl Parser {
-    pub fn parse_sql(sql: &str) -> Result<Statement> {
+impl<'a> Parser<'a> {
+    pub fn parse_sql(sql: &'a str) -> Result<Statement<'a>> {
         let mut lexer = Lexer::new(sql);
         let tokens = lexer.tokenize()?;
         let mut parser = Self { tokens, pos: 0 };
         parser.parse_statement()
     }
 
-    fn peek(&self) -> &Token {
+    #[inline]
+    fn peek(&self) -> &Token<'a> {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
 
-    fn peek_next(&self) -> &Token {
+    #[inline]
+    fn peek_next(&self) -> &Token<'a> {
         self.tokens.get(self.pos + 1).unwrap_or(&Token::Eof)
     }
 
-    fn advance(&mut self) -> &Token {
+    #[inline]
+    fn advance(&mut self) -> &Token<'a> {
         let idx = self.pos;
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
@@ -36,10 +40,12 @@ impl Parser {
         &self.tokens[idx]
     }
 
+    #[inline]
     fn check_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case(kw))
     }
 
+    #[inline]
     fn consume_kw(&mut self, kw: &str) -> bool {
         if self.check_kw(kw) {
             self.advance();
@@ -60,7 +66,7 @@ impl Parser {
         }
     }
 
-    fn expect_token(&mut self, expected: &Token) -> Result<()> {
+    fn expect_token(&mut self, expected: &Token<'_>) -> Result<()> {
         if self.peek() == expected {
             self.advance();
             Ok(())
@@ -73,44 +79,62 @@ impl Parser {
     }
 
     fn expect_ident(&mut self) -> Result<String> {
-        match self.advance().clone() {
-            Token::Ident(s) => Ok(s),
-            other => Err(DbError::new(
+        if matches!(self.peek(), Token::Ident(_)) {
+            let idx = self.pos;
+            self.advance();
+            match std::mem::replace(&mut self.tokens[idx], Token::Comma) {
+                Token::Ident(s) => Ok(s.into_owned()),
+                _ => unreachable!(),
+            }
+        } else {
+            Err(DbError::new(
                 ErrorCode::SyntaxError,
-                format!("expected identifier, found {:?}", other),
-            )),
+                format!("expected identifier, found {:?}", self.peek()),
+            ))
         }
     }
 
-    fn parse_statement(&mut self) -> Result<Statement> {
+    fn parse_statement(&mut self) -> Result<Statement<'a>> {
         if *self.peek() == Token::Eof {
             return Err(DbError::new(ErrorCode::SyntaxError, "empty SQL statement"));
         }
 
         let stmt = match self.peek() {
-            Token::Ident(kw) => match kw.to_ascii_uppercase().as_str() {
-                "CREATE" => self.parse_create()?,
-                "INSERT" => self.parse_insert()?,
-                "SELECT" => self.parse_select()?,
-                "UPDATE" => self.parse_update()?,
-                "DELETE" => self.parse_delete()?,
-                "BEGIN" => self.parse_begin()?,
-                "COMMIT" => self.parse_commit()?,
-                "ROLLBACK" => self.parse_rollback()?,
-                "ALTER" | "DROP" | "TRUNCATE" | "REPLACE" | "SHOW" | "EXPLAIN" | "PRAGMA"
-                | "USE" | "GRANT" | "REVOKE" | "SET" | "WITH" => {
+            Token::Ident(kw) => {
+                if kw.eq_ignore_ascii_case("SELECT") {
+                    self.parse_select()?
+                } else if kw.eq_ignore_ascii_case("INSERT") {
+                    self.parse_insert()?
+                } else if kw.eq_ignore_ascii_case("UPDATE") {
+                    self.parse_update()?
+                } else if kw.eq_ignore_ascii_case("DELETE") {
+                    self.parse_delete()?
+                } else if kw.eq_ignore_ascii_case("BEGIN") {
+                    self.parse_begin()?
+                } else if kw.eq_ignore_ascii_case("COMMIT") {
+                    self.parse_commit()?
+                } else if kw.eq_ignore_ascii_case("ROLLBACK") {
+                    self.parse_rollback()?
+                } else if kw.eq_ignore_ascii_case("CREATE") {
+                    self.parse_create()?
+                } else if [
+                    "ALTER", "DROP", "TRUNCATE", "REPLACE", "SHOW", "EXPLAIN", "PRAGMA", "USE",
+                    "GRANT", "REVOKE", "SET", "WITH",
+                ]
+                .iter()
+                .any(|k| kw.eq_ignore_ascii_case(k))
+                {
                     return Err(DbError::new(
                         ErrorCode::UnsupportedSql,
                         format!("unsupported SQL statement: {}", kw),
                     ));
-                }
-                other => {
+                } else {
                     return Err(DbError::new(
                         ErrorCode::SyntaxError,
-                        format!("unexpected SQL keyword '{}'", other),
+                        format!("unexpected SQL keyword '{}'", kw),
                     ));
                 }
-            },
+            }
             other => {
                 return Err(DbError::new(
                     ErrorCode::SyntaxError,
@@ -132,25 +156,25 @@ impl Parser {
         Ok(stmt)
     }
 
-    fn parse_begin(&mut self) -> Result<Statement> {
+    fn parse_begin(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("BEGIN")?;
         let _ = self.consume_kw("TRANSACTION");
         Ok(Statement::Begin)
     }
 
-    fn parse_commit(&mut self) -> Result<Statement> {
+    fn parse_commit(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("COMMIT")?;
         let _ = self.consume_kw("TRANSACTION");
         Ok(Statement::Commit)
     }
 
-    fn parse_rollback(&mut self) -> Result<Statement> {
+    fn parse_rollback(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("ROLLBACK")?;
         let _ = self.consume_kw("TRANSACTION");
         Ok(Statement::Rollback)
     }
 
-    fn parse_create(&mut self) -> Result<Statement> {
+    fn parse_create(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("CREATE")?;
         if self.consume_kw("TABLE") {
             let name = self.expect_ident()?;
@@ -248,53 +272,52 @@ impl Parser {
 
     fn parse_data_type(&mut self) -> Result<DataType> {
         let type_kw = self.expect_ident()?;
-        match type_kw.to_ascii_uppercase().as_str() {
-            "BIGINT" => Ok(DataType::BigInt),
-            "VARCHAR" => {
-                if *self.peek() == Token::LParen {
-                    self.advance();
-                    let len = self.parse_usize_lit()?;
-                    self.expect_token(&Token::RParen)?;
-                    Ok(DataType::Varchar(len))
-                } else {
-                    Ok(DataType::Varchar(65535))
-                }
-            }
-            "VECTOR" => {
-                self.expect_token(&Token::LParen)?;
-                let dim = self.parse_usize_lit()?;
+        if type_kw.eq_ignore_ascii_case("BIGINT") {
+            Ok(DataType::BigInt)
+        } else if type_kw.eq_ignore_ascii_case("VARCHAR") {
+            if *self.peek() == Token::LParen {
+                self.advance();
+                let len = self.parse_usize_lit()?;
                 self.expect_token(&Token::RParen)?;
-                if dim == 0 {
-                    return Err(DbError::new(
-                        ErrorCode::InvalidVector,
-                        "VECTOR dimension must be > 0",
-                    ));
-                }
-                Ok(DataType::Vector(dim))
+                Ok(DataType::Varchar(len))
+            } else {
+                Ok(DataType::Varchar(65535))
             }
-            other => Err(DbError::new(
+        } else if type_kw.eq_ignore_ascii_case("VECTOR") {
+            self.expect_token(&Token::LParen)?;
+            let dim = self.parse_usize_lit()?;
+            self.expect_token(&Token::RParen)?;
+            if dim == 0 {
+                return Err(DbError::new(
+                    ErrorCode::InvalidVector,
+                    "VECTOR dimension must be > 0",
+                ));
+            }
+            Ok(DataType::Vector(dim))
+        } else {
+            Err(DbError::new(
                 ErrorCode::UnsupportedSql,
-                format!("unsupported column data type '{}'", other),
-            )),
+                format!("unsupported column data type '{}'", type_kw),
+            ))
         }
     }
 
     fn parse_usize_lit(&mut self) -> Result<usize> {
-        match self.advance().clone() {
+        match *self.advance() {
             Token::NumberLit(s) => s.parse::<usize>().map_err(|_| {
                 DbError::new(
                     ErrorCode::SyntaxError,
                     format!("expected positive integer, found '{}'", s),
                 )
             }),
-            other => Err(DbError::new(
+            ref other => Err(DbError::new(
                 ErrorCode::SyntaxError,
                 format!("expected integer literal, found {:?}", other),
             )),
         }
     }
 
-    fn parse_insert(&mut self) -> Result<Statement> {
+    fn parse_insert(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("INSERT")?;
         self.expect_kw("INTO")?;
         let table_name = self.expect_ident()?;
@@ -316,9 +339,10 @@ impl Parser {
         };
         self.expect_kw("VALUES")?;
         let mut rows = Vec::new();
+        let mut est_cols = columns.as_ref().map_or(3, |c| c.len());
         loop {
             self.expect_token(&Token::LParen)?;
-            let mut vals = Vec::new();
+            let mut vals = Vec::with_capacity(est_cols);
             loop {
                 vals.push(self.parse_literal()?);
                 if *self.peek() == Token::Comma {
@@ -328,6 +352,7 @@ impl Parser {
                 }
             }
             self.expect_token(&Token::RParen)?;
+            est_cols = vals.len();
             rows.push(vals);
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -343,7 +368,8 @@ impl Parser {
     }
 
     /// Take the string literal at the cursor out of the token stream (no copy).
-    fn take_string_lit(&mut self) -> Option<String> {
+    #[inline]
+    fn take_string_lit(&mut self) -> Option<Cow<'a, str>> {
         if !matches!(self.peek(), Token::StringLit(_)) {
             return None;
         }
@@ -355,18 +381,14 @@ impl Parser {
         }
     }
 
-    fn parse_literal(&mut self) -> Result<LiteralValue> {
+    fn parse_literal(&mut self) -> Result<LiteralValue<'a>> {
         if let Some(s) = self.take_string_lit() {
             return Ok(LiteralValue::Str(s));
         }
-        match self.peek().clone() {
+        match self.peek() {
             Token::Ident(s) if s.eq_ignore_ascii_case("NULL") => {
                 self.advance();
                 Ok(LiteralValue::Null)
-            }
-            Token::StringLit(s) => {
-                self.advance();
-                Ok(LiteralValue::Str(s))
             }
             Token::LBracket => {
                 self.advance();
@@ -393,35 +415,38 @@ impl Parser {
         }
     }
 
-    fn parse_signed_number(&mut self) -> Result<LiteralValue> {
-        let mut sign = "";
+    fn parse_signed_number(&mut self) -> Result<LiteralValue<'a>> {
+        let mut neg = false;
         if *self.peek() == Token::Minus {
             self.advance();
-            sign = "-";
+            neg = true;
         } else if *self.peek() == Token::Plus {
             self.advance();
         }
-        match self.advance().clone() {
+        match *self.advance() {
             Token::NumberLit(s) => {
-                let full = if sign.is_empty() {
-                    s
-                } else {
-                    format!("{}{}", sign, s)
-                };
-                if !full.contains('.') && !full.contains('e') && !full.contains('E') {
-                    if let Ok(iv) = full.parse::<i64>() {
-                        return Ok(LiteralValue::Int(iv));
+                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                    if let Ok(uv) = s.parse::<u64>() {
+                        if neg {
+                            if uv == (i64::MAX as u64) + 1 {
+                                return Ok(LiteralValue::Int(i64::MIN));
+                            } else if uv <= i64::MAX as u64 {
+                                return Ok(LiteralValue::Int(-(uv as i64)));
+                            }
+                        } else if uv <= i64::MAX as u64 {
+                            return Ok(LiteralValue::Int(uv as i64));
+                        }
                     }
                 }
-                let fv: f64 = full.parse().map_err(|_| {
+                let fv: f64 = s.parse().map_err(|_| {
                     DbError::new(
                         ErrorCode::SyntaxError,
-                        format!("invalid numeric literal '{}'", full),
+                        format!("invalid numeric literal '{}{}'", if neg { "-" } else { "" }, s),
                     )
                 })?;
-                Ok(LiteralValue::Float(fv))
+                Ok(LiteralValue::Float(if neg { -fv } else { fv }))
             }
-            other => Err(DbError::new(
+            ref other => Err(DbError::new(
                 ErrorCode::SyntaxError,
                 format!("expected number literal, found {:?}", other),
             )),
@@ -429,40 +454,31 @@ impl Parser {
     }
 
     fn parse_signed_f64(&mut self) -> Result<f64> {
-        let mut sign = "";
+        let mut neg = false;
         if *self.peek() == Token::Minus {
             self.advance();
-            sign = "-";
+            neg = true;
         } else if *self.peek() == Token::Plus {
             self.advance();
         }
-        match self.advance().clone() {
+        match self.advance() {
             Token::NumberLit(s) => {
-                let full = if sign.is_empty() {
-                    s
-                } else {
-                    format!("{}{}", sign, s)
-                };
-                full.parse::<f64>().map_err(|_| {
+                let v = s.parse::<f64>().map_err(|_| {
                     DbError::new(
                         ErrorCode::InvalidVector,
-                        format!("invalid float literal '{}'", full),
+                        format!("invalid float literal '{}{}'", if neg { "-" } else { "" }, s),
                     )
-                })
+                })?;
+                Ok(if neg { -v } else { v })
             }
             Token::Ident(s) => {
                 // Allow catching NaN/Infinity tokens cleanly as InvalidVector
-                let full = if sign.is_empty() {
-                    s
-                } else {
-                    format!("{}{}", sign, s)
-                };
-                if let Ok(v) = full.parse::<f64>() {
-                    Ok(v)
+                if let Ok(v) = s.parse::<f64>() {
+                    Ok(if neg { -v } else { v })
                 } else {
                     Err(DbError::new(
                         ErrorCode::InvalidVector,
-                        format!("invalid element '{}' in vector", full),
+                        format!("invalid element '{}{}' in vector", if neg { "-" } else { "" }, s),
                     ))
                 }
             }
@@ -473,7 +489,7 @@ impl Parser {
         }
     }
 
-    fn parse_select(&mut self) -> Result<Statement> {
+    fn parse_select(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("SELECT")?;
         if self.check_kw("DISTINCT") {
             return Err(DbError::new(
@@ -570,16 +586,16 @@ impl Parser {
         })
     }
 
-    fn parse_select_item(&mut self) -> Result<SelectItem> {
+    fn parse_select_item(&mut self) -> Result<SelectItem<'a>> {
         if *self.peek() == Token::Star {
             self.advance();
             return Ok(SelectItem::Wildcard);
         }
         if let Token::Ident(fn_name) = self.peek() {
-            if matches!(
-                fn_name.to_ascii_uppercase().as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-            ) && *self.peek_next() == Token::LParen
+            if ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+                .iter()
+                .any(|f| fn_name.eq_ignore_ascii_case(f))
+                && *self.peek_next() == Token::LParen
             {
                 return Err(DbError::new(
                     ErrorCode::UnsupportedSql,
@@ -616,7 +632,7 @@ impl Parser {
         Ok(SelectItem::Column { name, alias })
     }
 
-    fn parse_l2_distance_call(&mut self) -> Result<(String, QueryVector)> {
+    fn parse_l2_distance_call(&mut self) -> Result<(String, QueryVector<'a>)> {
         self.expect_kw("L2_DISTANCE")?;
         self.expect_token(&Token::LParen)?;
         // Support both L2_DISTANCE(col, '[...]') and L2_DISTANCE('[...]', col)
@@ -644,15 +660,11 @@ impl Parser {
         Ok((col, query))
     }
 
-    fn parse_query_vector(&mut self) -> Result<QueryVector> {
+    fn parse_query_vector(&mut self) -> Result<QueryVector<'a>> {
         if let Some(s) = self.take_string_lit() {
             return Ok(QueryVector::Text(s));
         }
-        match self.peek().clone() {
-            Token::StringLit(s) => {
-                self.advance();
-                Ok(QueryVector::Text(s))
-            }
+        match self.peek() {
             Token::LBracket => {
                 let lit = self.parse_literal()?;
                 match lit {
@@ -667,7 +679,7 @@ impl Parser {
         }
     }
 
-    fn parse_update(&mut self) -> Result<Statement> {
+    fn parse_update(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("UPDATE")?;
         let table_name = self.expect_ident()?;
         self.expect_kw("SET")?;
@@ -695,7 +707,7 @@ impl Parser {
         })
     }
 
-    fn parse_delete(&mut self) -> Result<Statement> {
+    fn parse_delete(&mut self) -> Result<Statement<'a>> {
         self.expect_kw("DELETE")?;
         self.expect_kw("FROM")?;
         let table_name = self.expect_ident()?;
@@ -710,11 +722,11 @@ impl Parser {
         })
     }
 
-    fn parse_expr(&mut self) -> Result<Expr> {
+    fn parse_expr(&mut self) -> Result<Expr<'a>> {
         self.parse_or()
     }
 
-    fn parse_or(&mut self) -> Result<Expr> {
+    fn parse_or(&mut self) -> Result<Expr<'a>> {
         let mut left = self.parse_and()?;
         while self.consume_kw("OR") {
             let right = self.parse_and()?;
@@ -727,7 +739,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_and(&mut self) -> Result<Expr> {
+    fn parse_and(&mut self) -> Result<Expr<'a>> {
         let mut left = self.parse_not()?;
         while self.consume_kw("AND") {
             let right = self.parse_not()?;
@@ -740,7 +752,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_not(&mut self) -> Result<Expr> {
+    fn parse_not(&mut self) -> Result<Expr<'a>> {
         if self.consume_kw("NOT") {
             let inner = self.parse_not()?;
             return Ok(Expr::UnaryNot(Box::new(inner)));
@@ -748,7 +760,7 @@ impl Parser {
         self.parse_comparison()
     }
 
-    fn parse_comparison(&mut self) -> Result<Expr> {
+    fn parse_comparison(&mut self) -> Result<Expr<'a>> {
         let left = self.parse_primary()?;
         if self.consume_kw("IS") {
             let negated = self.consume_kw("NOT");
@@ -848,8 +860,8 @@ impl Parser {
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr> {
-        match self.peek().clone() {
+    fn parse_primary(&mut self) -> Result<Expr<'a>> {
+        match self.peek() {
             Token::LParen => {
                 self.advance();
                 if self.check_kw("SELECT") {
@@ -872,8 +884,8 @@ impl Parser {
                 let (column, query) = self.parse_l2_distance_call()?;
                 Ok(Expr::L2Distance { column, query })
             }
-            Token::Ident(s) => {
-                self.advance();
+            Token::Ident(_) => {
+                let s = self.expect_ident()?;
                 Ok(Expr::Column(s))
             }
             Token::StringLit(_)

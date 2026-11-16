@@ -1,10 +1,11 @@
 use crate::common::error::{DbError, ErrorCode, Result};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Token {
-    Ident(String),
-    StringLit(String),
-    NumberLit(String),
+pub enum Token<'a> {
+    Ident(Cow<'a, str>),
+    StringLit(Cow<'a, str>),
+    NumberLit(&'a str),
     LParen,
     RParen,
     LBracket,
@@ -24,7 +25,7 @@ pub enum Token {
     Eof,
 }
 
-/// Single-pass UTF-8 SQL lexer.
+/// Single-pass UTF-8 SQL lexer borrowing slices from the input SQL string.
 pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
@@ -35,7 +36,7 @@ impl<'a> Lexer<'a> {
         Self { input, pos: 0 }
     }
 
-    pub fn tokenize(&mut self) -> Result<Vec<Token>> {
+    pub fn tokenize(&mut self) -> Result<Vec<Token<'a>>> {
         let mut tokens = Vec::with_capacity(self.input.len() / 8 + 8);
         loop {
             let tok = self.next_token()?;
@@ -111,7 +112,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn next_token(&mut self) -> Result<Token> {
+    fn next_token(&mut self) -> Result<Token<'a>> {
         self.skip_whitespace_and_comments()?;
         let Some(ch) = self.peek_char() else {
             return Ok(Token::Eof);
@@ -119,53 +120,53 @@ impl<'a> Lexer<'a> {
 
         match ch {
             '(' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::LParen)
             }
             ')' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::RParen)
             }
             '[' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::LBracket)
             }
             ']' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::RBracket)
             }
             ',' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Comma)
             }
             ';' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Semicolon)
             }
             '*' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Star)
             }
             '+' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Plus)
             }
             '-' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Minus)
             }
             '.' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Dot)
             }
             '=' => {
-                self.advance_char();
+                self.pos += 1;
                 Ok(Token::Eq)
             }
             '!' => {
-                self.advance_char();
+                self.pos += 1;
                 if self.peek_char() == Some('=') {
-                    self.advance_char();
+                    self.pos += 1;
                     Ok(Token::Neq)
                 } else {
                     Err(DbError::new(
@@ -175,23 +176,23 @@ impl<'a> Lexer<'a> {
                 }
             }
             '<' => {
-                self.advance_char();
+                self.pos += 1;
                 match self.peek_char() {
                     Some('=') => {
-                        self.advance_char();
+                        self.pos += 1;
                         Ok(Token::Lte)
                     }
                     Some('>') => {
-                        self.advance_char();
+                        self.pos += 1;
                         Ok(Token::Neq)
                     }
                     _ => Ok(Token::Lt),
                 }
             }
             '>' => {
-                self.advance_char();
+                self.pos += 1;
                 if self.peek_char() == Some('=') {
-                    self.advance_char();
+                    self.pos += 1;
                     Ok(Token::Gte)
                 } else {
                     Ok(Token::Gt)
@@ -208,8 +209,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_string_literal(&mut self) -> Result<Token> {
-        self.advance_char(); // opening quote
+    fn read_string_literal(&mut self) -> Result<Token<'a>> {
+        self.pos += 1; // opening quote
         let start = self.pos;
         let rest = &self.input[start..];
         let Some(first_quote) = rest.find('\'') else {
@@ -221,7 +222,7 @@ impl<'a> Lexer<'a> {
         let after_quote = start + first_quote + 1;
         if self.input.as_bytes().get(after_quote) != Some(&b'\'') {
             self.pos = after_quote;
-            return Ok(Token::StringLit(rest[..first_quote].to_string()));
+            return Ok(Token::StringLit(Cow::Borrowed(&rest[..first_quote])));
         }
         let mut out = String::with_capacity(first_quote + 16);
         out.push_str(&rest[..first_quote]);
@@ -236,10 +237,10 @@ impl<'a> Lexer<'a> {
             };
             if ch == '\'' {
                 if self.peek_char() == Some('\'') {
-                    self.advance_char();
+                    self.pos += 1;
                     out.push('\'');
                 } else {
-                    return Ok(Token::StringLit(out));
+                    return Ok(Token::StringLit(Cow::Owned(out)));
                 }
             } else {
                 out.push(ch);
@@ -247,8 +248,23 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_quoted_ident(&mut self, quote: char) -> Result<Token> {
-        self.advance_char();
+    fn read_quoted_ident(&mut self, quote: char) -> Result<Token<'a>> {
+        self.pos += 1;
+        let start = self.pos;
+        let rest = &self.input[start..];
+        if let Some(first_quote) = rest.find(quote) {
+            let after_quote = start + first_quote + 1;
+            if self.input.as_bytes().get(after_quote) != Some(&(quote as u8)) {
+                if first_quote == 0 {
+                    return Err(DbError::new(
+                        ErrorCode::SyntaxError,
+                        "empty quoted identifier",
+                    ));
+                }
+                self.pos = after_quote;
+                return Ok(Token::Ident(Cow::Borrowed(&rest[..first_quote])));
+            }
+        }
         let mut out = String::new();
         loop {
             let Some(ch) = self.advance_char() else {
@@ -259,7 +275,7 @@ impl<'a> Lexer<'a> {
             };
             if ch == quote {
                 if self.peek_char() == Some(quote) {
-                    self.advance_char();
+                    self.pos += 1;
                     out.push(quote);
                 } else {
                     if out.is_empty() {
@@ -268,7 +284,7 @@ impl<'a> Lexer<'a> {
                             "empty quoted identifier",
                         ));
                     }
-                    return Ok(Token::Ident(out));
+                    return Ok(Token::Ident(Cow::Owned(out)));
                 }
             } else {
                 out.push(ch);
@@ -276,38 +292,27 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_number_literal(&mut self) -> Result<Token> {
+    fn read_number_literal(&mut self) -> Result<Token<'a>> {
         let start = self.pos;
-        while let Some(c) = self.peek_char() {
-            if c.is_ascii_digit() {
-                self.advance_char();
-            } else {
-                break;
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if self.pos < bytes.len() && bytes[self.pos] == b'.' {
+            self.pos += 1;
+            while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+                self.pos += 1;
             }
         }
-        if self.peek_char() == Some('.') {
-            self.advance_char();
-            while let Some(c) = self.peek_char() {
-                if c.is_ascii_digit() {
-                    self.advance_char();
-                } else {
-                    break;
-                }
-            }
-        }
-        if matches!(self.peek_char(), Some('e' | 'E')) {
-            self.advance_char();
-            if matches!(self.peek_char(), Some('+' | '-')) {
-                self.advance_char();
+        if self.pos < bytes.len() && matches!(bytes[self.pos], b'e' | b'E') {
+            self.pos += 1;
+            if self.pos < bytes.len() && matches!(bytes[self.pos], b'+' | b'-') {
+                self.pos += 1;
             }
             let mut has_exp_digit = false;
-            while let Some(c) = self.peek_char() {
-                if c.is_ascii_digit() {
-                    has_exp_digit = true;
-                    self.advance_char();
-                } else {
-                    break;
-                }
+            while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+                has_exp_digit = true;
+                self.pos += 1;
             }
             if !has_exp_digit {
                 return Err(DbError::new(
@@ -316,26 +321,25 @@ impl<'a> Lexer<'a> {
                 ));
             }
         }
-        Ok(Token::NumberLit(self.input[start..self.pos].to_string()))
+        Ok(Token::NumberLit(&self.input[start..self.pos]))
     }
 
-    fn read_ident(&mut self) -> Token {
+    fn read_ident(&mut self) -> Token<'a> {
         let start = self.pos;
-        while let Some(c) = self.peek_char() {
-            if is_ident_continue(c) {
-                self.advance_char();
-            } else {
-                break;
-            }
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() && is_ident_continue_byte(bytes[self.pos]) {
+            self.pos += 1;
         }
-        Token::Ident(self.input[start..self.pos].to_string())
+        Token::Ident(Cow::Borrowed(&self.input[start..self.pos]))
     }
 }
 
+#[inline]
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+#[inline]
+fn is_ident_continue_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }

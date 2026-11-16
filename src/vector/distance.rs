@@ -363,28 +363,140 @@ unsafe fn sq_lower_bounds_avx2(
     let words = stride / 32;
 
     #[inline(always)]
-    unsafe fn row_lb(rp: *const u8, qp: *const u8, words: usize, one: __m256i, ones16: __m256i) -> u32 {
+    unsafe fn row_acc(
+        rp: *const u8,
+        qp: *const u8,
+        words: usize,
+        one: __m256i,
+        ones16: __m256i,
+    ) -> __m256i {
         let mut acc = _mm256_setzero_si256();
         for w in 0..words {
             let x = _mm256_loadu_si256(rp.add(w * 32) as *const __m256i);
             let y = _mm256_loadu_si256(qp.add(w * 32) as *const __m256i);
             // |x - y| - 1 saturated at 0; codes are 7-bit, so the value fits a signed byte
             // and each maddubs pair (<= 2 * 126^2) fits a signed 16-bit lane.
-            let d = _mm256_subs_epu8(_mm256_or_si256(_mm256_subs_epu8(x, y), _mm256_subs_epu8(y, x)), one);
+            let d = _mm256_subs_epu8(
+                _mm256_or_si256(_mm256_subs_epu8(x, y), _mm256_subs_epu8(y, x)),
+                one,
+            );
             let sq16 = _mm256_maddubs_epi16(d, d);
             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(sq16, ones16));
         }
+        acc
+    }
+
+    #[inline(always)]
+    unsafe fn row_acc_128(
+        rp: *const u8,
+        q0: __m256i,
+        q1: __m256i,
+        q2: __m256i,
+        q3: __m256i,
+        one: __m256i,
+        ones16: __m256i,
+    ) -> __m256i {
+        let x0 = _mm256_loadu_si256(rp as *const __m256i);
+        let d0 = _mm256_subs_epu8(
+            _mm256_or_si256(_mm256_subs_epu8(x0, q0), _mm256_subs_epu8(q0, x0)),
+            one,
+        );
+        let mut acc = _mm256_madd_epi16(_mm256_maddubs_epi16(d0, d0), ones16);
+
+        let x1 = _mm256_loadu_si256(rp.add(32) as *const __m256i);
+        let d1 = _mm256_subs_epu8(
+            _mm256_or_si256(_mm256_subs_epu8(x1, q1), _mm256_subs_epu8(q1, x1)),
+            one,
+        );
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(d1, d1), ones16));
+
+        let x2 = _mm256_loadu_si256(rp.add(64) as *const __m256i);
+        let d2 = _mm256_subs_epu8(
+            _mm256_or_si256(_mm256_subs_epu8(x2, q2), _mm256_subs_epu8(q2, x2)),
+            one,
+        );
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(d2, d2), ones16));
+
+        let x3 = _mm256_loadu_si256(rp.add(96) as *const __m256i);
+        let d3 = _mm256_subs_epu8(
+            _mm256_or_si256(_mm256_subs_epu8(x3, q3), _mm256_subs_epu8(q3, x3)),
+            one,
+        );
+        _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(d3, d3), ones16))
+    }
+
+    #[inline(always)]
+    unsafe fn reduce_acc(acc: __m256i) -> u32 {
         let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
         let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
         let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x11));
         _mm_cvtsi128_si32(s) as u32
     }
 
+    #[inline(always)]
+    unsafe fn reduce_acc4(
+        acc0: __m256i,
+        acc1: __m256i,
+        acc2: __m256i,
+        acc3: __m256i,
+    ) -> __m128i {
+        let h01 = _mm256_hadd_epi32(acc0, acc1);
+        let h23 = _mm256_hadd_epi32(acc2, acc3);
+        let h0123 = _mm256_hadd_epi32(h01, h23);
+        _mm_add_epi32(
+            _mm256_castsi256_si128(h0123),
+            _mm256_extracti128_si256(h0123, 1),
+        )
+    }
+
     match mask {
         None => {
             let out = lbs.as_mut_ptr().add(lbs.len());
-            for r in 0..rows {
-                *out.add(r) = row_lb(base.add(r * stride), qp, words, one, ones16);
+            let mut r = 0usize;
+            if words == 4 {
+                let q0 = _mm256_loadu_si256(qp as *const __m256i);
+                let q1 = _mm256_loadu_si256(qp.add(32) as *const __m256i);
+                let q2 = _mm256_loadu_si256(qp.add(64) as *const __m256i);
+                let q3 = _mm256_loadu_si256(qp.add(96) as *const __m256i);
+                while r + 4 <= rows {
+                    let acc0 = row_acc_128(base.add(r * 128), q0, q1, q2, q3, one, ones16);
+                    let acc1 = row_acc_128(base.add((r + 1) * 128), q0, q1, q2, q3, one, ones16);
+                    let acc2 = row_acc_128(base.add((r + 2) * 128), q0, q1, q2, q3, one, ones16);
+                    let acc3 = row_acc_128(base.add((r + 3) * 128), q0, q1, q2, q3, one, ones16);
+                    _mm_storeu_si128(
+                        out.add(r) as *mut __m128i,
+                        reduce_acc4(acc0, acc1, acc2, acc3),
+                    );
+                    r += 4;
+                }
+                while r < rows {
+                    *out.add(r) = reduce_acc(row_acc_128(
+                        base.add(r * 128),
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                        one,
+                        ones16,
+                    ));
+                    r += 1;
+                }
+            } else {
+                while r + 4 <= rows {
+                    let acc0 = row_acc(base.add(r * stride), qp, words, one, ones16);
+                    let acc1 = row_acc(base.add((r + 1) * stride), qp, words, one, ones16);
+                    let acc2 = row_acc(base.add((r + 2) * stride), qp, words, one, ones16);
+                    let acc3 = row_acc(base.add((r + 3) * stride), qp, words, one, ones16);
+                    _mm_storeu_si128(
+                        out.add(r) as *mut __m128i,
+                        reduce_acc4(acc0, acc1, acc2, acc3),
+                    );
+                    r += 4;
+                }
+                while r < rows {
+                    *out.add(r) = reduce_acc(row_acc(base.add(r * stride), qp, words, one, ones16));
+                    r += 1;
+                }
             }
             lbs.set_len(lbs.len() + rows);
         }
@@ -392,24 +504,68 @@ unsafe fn sq_lower_bounds_avx2(
             let zero = _mm256_setzero_si256();
             let mp = m.as_ptr();
             let mut r0 = 0usize;
-            while r0 < rows {
-                // Bitmap of selected rows among the next (up to) 32.
-                let mut bits: u32 = if r0 + 32 <= rows {
-                    !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(mp.add(r0) as *const __m256i), zero)) as u32)
-                } else {
-                    let mut b = 0u32;
-                    for j in 0..rows - r0 {
-                        b |= ((*mp.add(r0 + j) != 0) as u32) << j;
+            if words == 4 {
+                let q0 = _mm256_loadu_si256(qp as *const __m256i);
+                let q1 = _mm256_loadu_si256(qp.add(32) as *const __m256i);
+                let q2 = _mm256_loadu_si256(qp.add(64) as *const __m256i);
+                let q3 = _mm256_loadu_si256(qp.add(96) as *const __m256i);
+                while r0 < rows {
+                    let mut bits: u32 = if r0 + 32 <= rows {
+                        !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+                            _mm256_loadu_si256(mp.add(r0) as *const __m256i),
+                            zero,
+                        )) as u32)
+                    } else {
+                        let mut b = 0u32;
+                        for j in 0..rows - r0 {
+                            b |= ((*mp.add(r0 + j) != 0) as u32) << j;
+                        }
+                        b
+                    };
+                    while bits != 0 {
+                        let r = r0 + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        lbs.push(reduce_acc(row_acc_128(
+                            base.add(r * 128),
+                            q0,
+                            q1,
+                            q2,
+                            q3,
+                            one,
+                            ones16,
+                        )));
+                        slots.push(first_slot + r as u32);
                     }
-                    b
-                };
-                while bits != 0 {
-                    let r = r0 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    lbs.push(row_lb(base.add(r * stride), qp, words, one, ones16));
-                    slots.push(first_slot + r as u32);
+                    r0 += 32;
                 }
-                r0 += 32;
+            } else {
+                while r0 < rows {
+                    let mut bits: u32 = if r0 + 32 <= rows {
+                        !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+                            _mm256_loadu_si256(mp.add(r0) as *const __m256i),
+                            zero,
+                        )) as u32)
+                    } else {
+                        let mut b = 0u32;
+                        for j in 0..rows - r0 {
+                            b |= ((*mp.add(r0 + j) != 0) as u32) << j;
+                        }
+                        b
+                    };
+                    while bits != 0 {
+                        let r = r0 + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        lbs.push(reduce_acc(row_acc(
+                            base.add(r * stride),
+                            qp,
+                            words,
+                            one,
+                            ones16,
+                        )));
+                        slots.push(first_slot + r as u32);
+                    }
+                    r0 += 32;
+                }
             }
         }
     }
