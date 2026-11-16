@@ -133,8 +133,18 @@ impl Database {
             Statement::Insert {
                 table_name,
                 columns,
-                rows,
-            } => self.exec_insert(&table_name, columns.as_deref(), rows),
+                flat_values,
+                row_count,
+                row_width,
+                bad_row_len,
+            } => self.exec_insert(
+                &table_name,
+                columns.as_deref(),
+                flat_values,
+                row_count,
+                row_width,
+                bad_row_len,
+            ),
             Statement::Select {
                 items,
                 table_name,
@@ -414,7 +424,10 @@ impl Database {
         &mut self,
         table_name: &str,
         col_names: Option<&[String]>,
-        raw_rows: Vec<Vec<LiteralValue<'_>>>,
+        flat_values: Vec<LiteralValue<'_>>,
+        row_count: usize,
+        row_width: usize,
+        bad_row_len: Option<usize>,
     ) -> Result<ExecResult> {
         let schema = self.resolve_table_schema(table_name)?;
         let col_mapping = resolve_insert_columns(&schema, col_names)?;
@@ -423,27 +436,46 @@ impl Database {
             let count = self
                 .storage
                 .get_table_mut(schema.table_id)?
-                .insert_autocommit_raw(&col_mapping, &raw_rows)?;
+                .insert_autocommit_raw(
+                    &col_mapping,
+                    &flat_values,
+                    row_count,
+                    row_width,
+                    bad_row_len,
+                )?;
             self.after_write(Some(schema.table_id))?;
             return Ok(ExecResult::AffectedRows(count));
         }
 
-        let mut prepared_rows = Vec::with_capacity(raw_rows.len());
-        let mut batch_pks = HashSet::with_capacity(raw_rows.len());
+        if row_width != col_mapping.len() {
+            return Err(DbError::new(
+                ErrorCode::SyntaxError,
+                format!(
+                    "column count mismatch: expected {}, got {}",
+                    col_mapping.len(),
+                    row_width
+                ),
+            ));
+        }
+        if let Some(bad_len) = bad_row_len {
+            return Err(DbError::new(
+                ErrorCode::SyntaxError,
+                format!(
+                    "column count mismatch: expected {}, got {}",
+                    col_mapping.len(),
+                    bad_len
+                ),
+            ));
+        }
 
-        for raw_vals in raw_rows {
-            if raw_vals.len() != col_mapping.len() {
-                return Err(DbError::new(
-                    ErrorCode::SyntaxError,
-                    format!(
-                        "column count mismatch: expected {}, got {}",
-                        col_mapping.len(),
-                        raw_vals.len()
-                    ),
-                ));
-            }
+        let mut prepared_rows = Vec::with_capacity(row_count);
+        let mut batch_pks = HashSet::with_capacity(row_count);
+
+        let mut iter = flat_values.into_iter();
+        for _ in 0..row_count {
             let mut row_vals = vec![Value::Null; schema.columns.len()];
-            for (lit, &col_idx) in raw_vals.into_iter().zip(col_mapping.iter()) {
+            for &col_idx in &col_mapping {
+                let lit = iter.next().unwrap();
                 let col_schema = &schema.columns[col_idx];
                 row_vals[col_idx] =
                     coerce_literal_owned(lit, &col_schema.data_type, col_schema.is_primary_key)?;

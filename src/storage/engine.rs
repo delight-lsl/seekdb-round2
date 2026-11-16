@@ -672,11 +672,33 @@ impl DiskTable {
     pub fn insert_autocommit_raw(
         &mut self,
         col_mapping: &[usize],
-        raw_rows: &[Vec<LiteralValue<'_>>],
+        flat_values: &[LiteralValue<'_>],
+        row_count: usize,
+        row_width: usize,
+        bad_row_len: Option<usize>,
     ) -> Result<usize> {
-        let count = raw_rows.len();
-        if count == 0 {
+        if row_count == 0 {
             return Ok(0);
+        }
+        if row_width != col_mapping.len() {
+            return Err(DbError::new(
+                ErrorCode::SyntaxError,
+                format!(
+                    "column count mismatch: expected {}, got {}",
+                    col_mapping.len(),
+                    row_width
+                ),
+            ));
+        }
+        if let Some(bad_len) = bad_row_len {
+            return Err(DbError::new(
+                ErrorCode::SyntaxError,
+                format!(
+                    "column count mismatch: expected {}, got {}",
+                    col_mapping.len(),
+                    bad_len
+                ),
+            ));
         }
         let num_cols = self.schema.columns.len();
         let pk_col = self.schema.pk_col_idx;
@@ -688,24 +710,14 @@ impl DiskTable {
         let mut vec_scratch = std::mem::take(&mut self.vec_scratch);
         vec_scratch.clear();
 
-        let mut staged: Vec<(RowId, Option<i64>, usize, u32)> = Vec::with_capacity(count);
+        let mut staged: Vec<(RowId, Option<i64>, usize, u32)> = Vec::with_capacity(row_count);
         let mut batch_pks: FastSet<i64> =
-            FastSet::with_capacity_and_hasher(count, Default::default());
+            FastSet::with_capacity_and_hasher(row_count, Default::default());
         let mut row_cells: Vec<RawCell<'_>> = vec![RawCell::Null; num_cols];
         let mut next_rid = self.next_row_id;
 
         let res: Result<()> = (|| {
-            for raw_vals in raw_rows {
-                if raw_vals.len() != col_mapping.len() {
-                    return Err(DbError::new(
-                        ErrorCode::SyntaxError,
-                        format!(
-                            "column count mismatch: expected {}, got {}",
-                            col_mapping.len(),
-                            raw_vals.len()
-                        ),
-                    ));
-                }
+            for raw_vals in flat_values.chunks_exact(row_width) {
                 row_cells.fill(RawCell::Null);
                 vec_scratch.clear();
 
@@ -883,7 +895,7 @@ impl DiskTable {
         }
         self.total_frames += staged.len() as u64;
         self.next_row_id = next_rid;
-        Ok(count)
+        Ok(row_count)
     }
 
     /// Give up the in-memory image and serve this table from its file.

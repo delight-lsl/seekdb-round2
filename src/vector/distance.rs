@@ -579,37 +579,59 @@ pub fn scan_le<F>(vals: &[u32], thr: u32, mut f: F)
 where
     F: FnMut(usize) -> u32,
 {
-    let mut thr = thr.min(i32::MAX as u32);
-    let mut i = 0usize;
+    let thr = thr.min(i32::MAX as u32);
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 availability checked; loads stay inside `vals`.
-            unsafe {
-                use std::arch::x86_64::*;
-                let p = vals.as_ptr();
-                let mut tv = _mm256_set1_epi32(thr as i32);
-                while i + 8 <= vals.len() {
-                    let v = _mm256_loadu_si256(p.add(i) as *const __m256i);
-                    let gt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, tv))) as u32;
-                    let mut hit = !gt & 0xff;
-                    if hit != 0 {
-                        while hit != 0 {
-                            let j = hit.trailing_zeros() as usize;
-                            hit &= hit - 1;
-                            if *p.add(i + j) <= thr {
-                                thr = f(i + j).min(thr);
-                            }
-                        }
-                        tv = _mm256_set1_epi32(thr as i32);
-                    }
-                    i += 8;
-                }
-            }
+            unsafe { scan_le_avx2(vals, thr, &mut f) };
+            return;
         }
     }
-    while i < vals.len() {
-        if vals[i] <= thr {
+    let mut thr = thr;
+    for (i, &v) in vals.iter().enumerate() {
+        if v <= thr {
+            thr = f(i).min(thr);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_le_avx2<F>(vals: &[u32], mut thr: u32, f: &mut F)
+where
+    F: FnMut(usize) -> u32,
+{
+    use std::arch::x86_64::*;
+    let p = vals.as_ptr();
+    let len = vals.len();
+    let mut i = 0usize;
+    let mut tv = _mm256_set1_epi32(thr as i32);
+
+    while i + 16 <= len {
+        let v0 = _mm256_loadu_si256(p.add(i) as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(i + 8) as *const __m256i);
+        let gt0 = _mm256_cmpgt_epi32(v0, tv);
+        let gt1 = _mm256_cmpgt_epi32(v1, tv);
+        // Fast skip when all 16 lanes (one 64-byte cache line) exceed `thr`.
+        if _mm256_movemask_epi8(_mm256_and_si256(gt0, gt1)) != -1 {
+            let m0 = (!(_mm256_movemask_ps(_mm256_castsi256_ps(gt0)) as u32)) & 0xff;
+            let m1 = (!(_mm256_movemask_ps(_mm256_castsi256_ps(gt1)) as u32)) & 0xff;
+            let mut hit = m0 | (m1 << 8);
+            while hit != 0 {
+                let j = hit.trailing_zeros() as usize;
+                hit &= hit - 1;
+                if *p.add(i + j) <= thr {
+                    thr = f(i + j).min(thr);
+                }
+            }
+            tv = _mm256_set1_epi32(thr as i32);
+        }
+        i += 16;
+    }
+
+    while i < len {
+        if *p.add(i) <= thr {
             thr = f(i).min(thr);
         }
         i += 1;

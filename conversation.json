@@ -11,7 +11,8 @@
     "通读 MiniVectorDB 全部源码并生成包含每一块功能实现方式与潜在问题的技术报告，实测官方 protocol_check/run.py --image minivectordb:latest 以及 T（耗时）、B（磁盘 I/O）、M（峰值内存）三个核心指标。",
     "按照 5 项深度优化方案（修复 scan_frames 提前停止误报与 LRU/FIFO 代数序号淘汰 Bug；引入 HnswIndex dirty 标记、64KiB CrcWriter 流式快照与 shutdown 预释放缓存；引入 storage_mode=2 外部表向量模式与 u16 紧凑邻居序列化消除与 .dat 的向量冗余落盘；引入纯 f32 AVX2+FMA 距离核与 Neighbor 增量反向边启发式裁剪提速 CREATE VECTOR INDEX；复用 WAL 行编码字节与零克隆投影快路径）修改优化，并重新运行官方测试与 3 轮 T、B、M 对比验证。",
     "结合赛题第 3.2 与 3.3 节小型性能 benchmark 评分细则（批量写入 1/3 + 向量 TopK 查询 2/3，T 60% / B 20% / M 20%，默认 exact 模式且无过滤与有过滤 Recall@10 均须 >= 0.95），排查为什么前一次提交分数下降，修复全部隐患并针对赛题评分公式做进一步极致优化。",
-    "突破传统 WAL 双写与 HNSW 构图/页缓存内存叠加瓶颈：将表数据文件重构为自包含提交日志（行数据全局只落盘一次 + 大事务组 4KiB 页边界对齐），引入列式内存镜像 MemTable + posix_fadvise(DONTNEED) 即时释放页缓存，将向量索引重构为数学可证明不漏检的 7-bit 标量量化下界码 SqCodes + AVX2 三遍精确扫描（Recall 恒为 1.0），并进一步落地借用式零拷贝 SQL Lexer/Parser、自动提交批量插入零中间对象直写 insert_autocommit_raw、低基数 VARCHAR 1-byte 字典去重编码、密集 RowId 槽位映射 SlotMap、QueryScratch 查询缓冲复用以及 128 维 4 行 _mm256_hadd_epi32 向量化归约。"
+    "突破传统 WAL 双写与 HNSW 构图/页缓存内存叠加瓶颈：将表数据文件重构为自包含提交日志（行数据全局只落盘一次 + 大事务组 4KiB 页边界对齐），引入列式内存镜像 MemTable + posix_fadvise(DONTNEED) 即时释放页缓存，将向量索引重构为数学可证明不漏检的 7-bit 标量量化下界码 SqCodes + AVX2 三遍精确扫描（Recall 恒为 1.0），并进一步落地借用式零拷贝 SQL Lexer/Parser、自动提交批量插入零中间对象直写 insert_autocommit_raw、低基数 VARCHAR 1-byte 字典去重编码、密集 RowId 槽位映射 SlotMap、QueryScratch 查询缓冲复用以及 128 维 4 行 _mm256_hadd_epi32 向量化归约。",
+    "评估 SPAA 2026 最新论文 CleanANN（动态图索引的搜索树后代多样性链接、查询自适应局部邻居合并与半惰性内存清理）在本赛题 10,000x128 维 + cgroup 峰值内存计分约束下的适用边界与代价，借鉴其半惰性墓碑清理思想优化 MemTable 空洞掩码生成，同时消除 Statement::Insert 二维嵌套 Vec 分配、消除 TopK Pass 1/Pass 2 间前 K 行精确距离重复计算，并修复 scan_le 缺失 #[target_feature(enable = \"avx2\")] 导致未内联的问题及引入 64B 缓存行 16 路快速跳过。"
   ],
   "conversations": [
     {
@@ -73,6 +74,16 @@
       "step": 12,
       "role": "assistant",
       "content": "已完成第四轮与第五轮架构重构及微架构级调优：1）表文件即提交日志（MVD1 增加 Commit=3 与 Pending=4 结束符，大事务组 4KiB 对齐，WAL2 仅记录 DDL 与跨表事务提交点），物理写入字节 B 从 11.30 MiB 减半至 5.47 MiB；2）列式内存镜像 MemTable + 写后/恢复时 posix_fadvise(DONTNEED) 即时释放页缓存 + 密集槽位数组 SlotMap（4B/行）+ 低基数 VARCHAR（<=254）字典去重与 1-byte 标签过滤，容器 cgroup 峰值内存 M 从 31.6 MiB 压降至 7.5~8.5 MiB；3）7-bit 标量量化下界码 SqCodes（步长扣除 2*8*EPSILON*max(mag,range) 严格保证下界成立）+ 128 维寄存器驻留查询向量与 4 行 _mm256_hadd_epi32 归约 + QueryScratch 查询缓冲复用，使 CREATE VECTOR INDEX 耗时从 2,350ms 降至 ~2ms，exact 与 ann 模式 Recall@10 恒为 1.0000，1,000 条查询耗时降至 312~359ms；4）借用式 Token<'a>/Statement<'a> 词法语法分析 + 自动提交批量插入零中间 Row/Vec<f32> 直写路径 insert_autocommit_raw + 手写 SWAR 8 位小数并行向量扫描器 parse_vector_fast_into + STDIO 管道 SSE2 找换行与 2ms 自适应短轮询，将批量写入耗时从 ~748ms 压降至 382~498ms。"
+    },
+    {
+      "step": 13,
+      "role": "student",
+      "content": "我最近看到 SPAA 2026 的新论文 CleanANN（针对动态图 ANNS 提出工作负载感知后代链接、查询自适应局部邻居合并与半惰性内存清理）。如果将这篇论文应用到本题中是否可以再度提升？此外当前第五轮代码在解析、扫描和精排阶段还有哪些微架构级提升空间？"
+    },
+    {
+      "step": 14,
+      "role": "assistant",
+      "content": "结合赛题 3.3 节负载（10,000x128 维、50% 查询带 10% 等值过滤、cgroup 峰值内存 M 占 20% 权重、Recall<0.95 判零分）对 CleanANN 进行了定量边界分析与选择性迁移，并完成第六轮深度优化：1）取舍分析：在 10,000 行规模下，7-bit 量化码仅 1.22 MiB，100% 常驻 CPU L3 Cache，顺序执行 40,000 条 AVX2 指令仅需 ~30us 且 10% 过滤仅算 1,000 行（~4us），Recall 恒为 1.0；若直接引入 CleanANN 图邻接表，不仅会增加 3~6 MiB 内存推高 M，且 150~300 次随机指针跳转（Cache Miss）耗时高于 L3 顺序 SIMD 扫描；2）迁移 CleanANN 半惰性墓碑清理思想：在 MemTable::fill_base_mask 中不再 O(N) 扫描 80KB 的 rids: Vec<u64>，而是直接遍历 free 墓碑栈以 O(holes) 复杂度清零已删除槽位；3）消除 Pass 1 与 Pass 2 间的重复精确距离计算：在 Pass 1 标定前 K 个最小下界行的真实 f64 距离时直接将其推入结果集 out 并写入 VISITED_SENTINEL (i32::MAX as u32) 屏蔽位，使 Pass 2 自动跳过这 K 行，每次查询少算 K=10 次 128 维 f64 精确距离（削减约 30% 精排计算量）；4）修复 scan_le 缺失 #[target_feature(enable = \"avx2\")] 导致 AVX2 intrinsic 未内联的瓶颈，并升级为每次并发检测 16 个 u32（64B 完整缓存行）的 _mm256_and_si256 + _mm256_movemask_epi8 快速跳过；5）将 Statement::Insert 的二维 Vec<Vec<LiteralValue>> 拍平为单次分配的一维 flat_values，每 10,000 行写入再消除 10,000 次内层 Vec 堆分配。"
     }
   ],
   "experiments": [
@@ -98,6 +109,6 @@
   "retrospective": {
     "problem_understanding": "本赛题不仅考察单机向量数据库的 SQL 语义、事务 ACID 与 SIGKILL 崩溃恢复正确性，还通过综合效率指标 E 同时衡量耗时 T、容器块设备读写字节数 B 以及包含 Page Cache 在内的容器生命周期峰值内存 M。因此必须从 CPU 计算（SIMD 与图裁剪算法）、I/O 布局（消除索引与数据文件的向量双写、跳过无变更 Checkpoint）与内存生命周期（流式落盘、精确预分配、关闭前预释放缓存）三个维度协同优化。",
     "tradeoffs": "在 HNSW 反向边增量启发式剪枝中，若直接将所有存量邻居视作非遮挡边，虽能进一步减少少量距离计算，但会导致第 0 层多样性边被遮挡补齐边挤占，使 128 维均匀分布下的无过滤 Recall@10 降至 0.83~0.91；通过在 Neighbor 结构体中利用符号位编码 Tier-1（多样性边）与 Tier-2（补齐边）并在 Tier-1 降级时增量重验，以极小的额外开销实现了 5.65 倍建索引加速且 Recall@10 稳定保持在 0.959 以上。",
-    "limitations": "当前系统针对赛题单机、单进程、单客户端、最多一个显式事务的场景设计，未引入多客户端并发控制（MVCC）与分布式分片；在千万级以上超大规模向量场景下可进一步结合乘积量化（PQ/SQ）与磁盘图索引（DiskANN）降低常驻内存占用。"
+    "limitations": "当前系统针对赛题单机、单进程、单客户端、最多一个显式事务的场景设计，未引入多客户端并发控制（MVCC）与分布式分片；在万级向量规模下，常驻 L3 Cache 的 7-bit 标量量化下界 + AVX2 扫描在耗时 T、内存 M 与 100% 召回上均优于重型图索引；而在百万至千万级以上高并发动态更新向量场景下，可进一步结合 SPAA 2026 CleanANN 的查询自适应局部邻居合并（Query-Adaptive Neighborhood Consolidation）与乘积量化（PQ）/磁盘图索引（DiskANN）平衡亚线性检索与内存开销。"
   }
 }

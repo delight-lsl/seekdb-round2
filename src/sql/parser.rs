@@ -338,13 +338,16 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_kw("VALUES")?;
-        let mut rows = Vec::new();
-        let mut est_cols = columns.as_ref().map_or(3, |c| c.len());
+        let remaining_tokens = self.tokens.len().saturating_sub(self.pos);
+        let mut flat_values = Vec::with_capacity((remaining_tokens / 2).max(8));
+        let mut row_count = 0usize;
+        let mut row_width = 0usize;
+        let mut bad_row_len = None;
         loop {
             self.expect_token(&Token::LParen)?;
-            let mut vals = Vec::with_capacity(est_cols);
+            let row_start = flat_values.len();
             loop {
-                vals.push(self.parse_literal()?);
+                flat_values.push(self.parse_literal()?);
                 if *self.peek() == Token::Comma {
                     self.advance();
                 } else {
@@ -352,8 +355,13 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_token(&Token::RParen)?;
-            est_cols = vals.len();
-            rows.push(vals);
+            let len = flat_values.len() - row_start;
+            if row_count == 0 {
+                row_width = len;
+            } else if len != row_width && bad_row_len.is_none() {
+                bad_row_len = Some(len);
+            }
+            row_count += 1;
             if *self.peek() == Token::Comma {
                 self.advance();
             } else {
@@ -363,7 +371,10 @@ impl<'a> Parser<'a> {
         Ok(Statement::Insert {
             table_name,
             columns,
-            rows,
+            flat_values,
+            row_count,
+            row_width,
+            bad_row_len,
         })
     }
 

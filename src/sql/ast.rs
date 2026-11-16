@@ -91,7 +91,10 @@ pub enum Statement<'a> {
     Insert {
         table_name: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<LiteralValue<'a>>>,
+        flat_values: Vec<LiteralValue<'a>>,
+        row_count: usize,
+        row_width: usize,
+        bad_row_len: Option<usize>,
     },
     Select {
         items: Vec<SelectItem<'a>>,

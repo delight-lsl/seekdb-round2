@@ -27,6 +27,7 @@ pub struct QueryScratch {
     pub qcodes: Vec<u8>,
     pub lbs: Vec<u32>,
     pub sel: Vec<u32>,
+    pub best: BinaryHeap<(u32, u32)>,
 }
 
 /// 7-bit scalar-quantized copy of a vector column used as a *lower-bound* filter.
@@ -830,13 +831,13 @@ impl MemTable {
     }
 
     /// Populate `mask` in place with the base selection mask: live rows whose vector column `col` is not NULL.
+    /// Uses semi-lazy tombstone tracking (`self.free`) to clear only deleted slots in `O(holes)` time.
     pub fn fill_base_mask(&self, vec_col: Option<usize>, mask: &mut Vec<u8>) {
         let n = self.rids.len();
         mask.clear();
-        if self.has_holes() {
-            mask.extend(self.rids.iter().map(|&r| (r != 0) as u8));
-        } else {
-            mask.resize(n, 1u8);
+        mask.resize(n, 1u8);
+        for &slot in &self.free {
+            mask[slot as usize] = 0;
         }
         if let Some(c) = vec_col {
             if let MemCol::Vector(v) = &self.cols[c] {
@@ -883,6 +884,9 @@ impl MemTable {
         use_mask: bool,
         scratch: &mut QueryScratch,
     ) -> Vec<(f64, Option<i64>, RowId, u32)> {
+        const VISITED_SENTINEL: u32 = i32::MAX as u32;
+        const MAX_SCAN_THR: u32 = (i32::MAX as u32) - 1;
+
         let Some(vc) = self.vec_col(col) else {
             return Vec::new();
         };
@@ -895,6 +899,7 @@ impl MemTable {
             ref mut qcodes,
             ref mut lbs,
             ref mut sel,
+            ref mut best,
         } = *scratch;
         let mask: Option<&[u8]> = if use_mask { Some(mask.as_slice()) } else { None };
         let q_max = query.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
@@ -932,8 +937,8 @@ impl MemTable {
             } else {
                 // Pass 1: the k rows with the smallest lower bounds give a first exact
                 // k-th distance (an upper bound of the final one).
-                let mut best: BinaryHeap<(u32, u32)> = BinaryHeap::with_capacity(k + 1);
-                scan_le(lbs, u32::MAX, |i| {
+                best.clear();
+                scan_le(lbs, MAX_SCAN_THR, |i| {
                     let item = (lbs[i], i as u32);
                     if best.len() < k {
                         best.push(item);
@@ -941,20 +946,31 @@ impl MemTable {
                         *best.peek_mut().unwrap() = item;
                     }
                     if best.len() < k {
-                        u32::MAX
+                        MAX_SCAN_THR
                     } else {
                         best.peek().unwrap().0
                     }
                 });
+                out = Vec::with_capacity(k * 6);
                 let mut kth = 0.0_f64;
-                for &(_, i) in best.iter() {
-                    kth = kth.max(exact(slot_at(i as usize, sel)).0);
+                for &(_, idx) in best.iter() {
+                    let i = idx as usize;
+                    let e = exact(slot_at(i, sel));
+                    if e.0 > kth {
+                        kth = e.0;
+                    }
+                    out.push(e);
+                    // Mark already-evaluated seed so Pass 2 never recomputes its exact distance.
+                    lbs[i] = VISITED_SENTINEL;
                 }
-                // Pass 2: only rows whose lower bound does not exceed that distance can
+                // Pass 2: only remaining rows whose lower bound does not exceed `kth` can
                 // tie or beat it; evaluate exactly those.
                 let t = (kth / sq.safe_step_sq).floor();
-                let thr = if t >= i32::MAX as f64 { i32::MAX as u32 } else { t as u32 };
-                out = Vec::with_capacity(k * 8);
+                let thr = if t >= MAX_SCAN_THR as f64 {
+                    MAX_SCAN_THR
+                } else {
+                    t as u32
+                };
                 scan_le(lbs, thr, |i| {
                     out.push(exact(slot_at(i, sel)));
                     thr
